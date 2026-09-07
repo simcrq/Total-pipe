@@ -30,6 +30,112 @@ workflow.json          rpa_input.json       deck_plan.json                      
 
 ---
 
+## ⚠️ 第一次跑就要走完：不许挑着用命令
+
+历史教训：RPA 有 20 个 CLI 命令 + 20 个 MCP 工具，实测第一次跑只用了 3 个就开工，
+`deck_plan.json` 沦为一次性产物。**根因不是 Agent 偷懒，是渲染层不消费 deck_plan
+——slidep 吃手写 SlideDSL，Agent 完全可以绕开规划。**
+
+现在用「骨架生成器」把这条路堵死，见下面阶段 4 的硬约束。
+
+### 阶段 3 必须按序跑完（缺一步不许进阶段 4）
+
+**首选方式：一条命令跑完，别手敲：**
+
+```bash
+python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/rpa_full_pipeline.py" \
+    --rpa-input F:/x/rpa_input.json \
+    --out-dir   F:/x \
+    --project   F:/x/deck \
+    --assets-from-slides        # 或 --assets-map 映射.json
+```
+
+它按 S1→S7 串行，任一步 FAIL 立即中断（退出码 1），每步产物落在 `<out-dir>/_rpa/`，
+并生成 `_pipeline_report.md`。常用开关：
+
+| 参数 | 用途 |
+| :-- | :-- |
+| `--assets-map m.json` | `{"4":["assets/fig1.png"]}` 显式指定每页用图 |
+| `--assets-from-slides` | 从 `<project>/slides/NN.slide` grep 图片引用自动映射 |
+| `--skeleton-out slides` | 默认 `slides_skeleton`（**不会覆盖正式页面**）；显式改 slides 才覆盖 |
+| `--skeleton-force` | 骨架目录已有 .slide 时强制覆盖 |
+| `--allow-visual-fail` | S5 几何不兼容仍继续（仅当手写 DSL 不按 RPA 槽位摆位时用） |
+| `--strict` | warning 也当失败 |
+
+S1–S7 分别是：normalize-content → plan → validate-deck → preflight →
+visual-fit-preflight（每图）→ group-fit-preflight（多图页）→ deckplan2slide 骨架。
+
+**S5 失败时脚本会直接给替代版面**（按图槽几何算 contain 填充率排序），照着把该页
+brief 的 `category_hint` 改掉再重跑即可，不用自己翻版面库。
+
+<details><summary>手工分步跑法（脚本出问题时才用）</summary>
+
+```bash
+NODE=D:/Node24/node.exe
+RPA=C:/Users/Beibei/plugins/research-ppt-assistant
+cd $RPA
+$NODE server/cli.mjs normalize-content --file <rpa_input.json> --detail-level compact  > content_model.json
+$NODE server/cli.mjs plan --file <rpa_input.json> --presentation-type group_meeting \
+      --slide-count N --detail-level compact                                          > deck_plan.json
+$NODE server/cli.mjs validate-deck  --file <deck_plan 与 content_model 合并后的 json>
+$NODE server/cli.mjs preflight      --file preflight-input.json
+```
+
+`preflight-input.json` 模板（`deck_plan.slides` 必须填完整数组）：
+
+```json
+{
+  "renderer_inputs": {
+    "requested_renderer": "slidep", "renderer_version": "5.4.4", "platform": "win32",
+    "project_path": "<PPT项目目录绝对路径>", "project_exists": true,
+    "source_files": ["slides/01.slide"], "live_watch_requested": false
+  },
+  "deck_plan": { "theme_id": "paper_blue", "slides": [] }
+}
+```
+
+`visual-fit-preflight` 最小输入（注意 `visual_container.content_bbox` 若给则必须
+**等于** `allocated_visual_bbox`，否则抛 RangeError）：
+
+```json
+{
+  "visual_id": "P04:visual",
+  "source": {"width": 1440, "height": 1253},
+  "source_region": {"x": 0, "y": 0, "width": 1440, "height": 1253},
+  "visual_intent": {"visual_type": "dense_plot", "crop_policy": "full_figure",
+                    "fit_policy": "contain", "priority": "primary_visual"},
+  "visual_container": {"container_id": "visual"},
+  "allocated_visual_bbox": {"x": 659.1, "y": 388.8, "width": 550.4, "height": 223.2}
+}
+```
+
+`allocated_visual_bbox` = 版面 `slot_specs[].pptx_in` × 96（英寸→px）。
+
+</details>
+
+过关线：`pipeline_status == preflight_complete` 且 `status != invalid`，无重复 pageId。
+页面带科研图必跑 `visual-fit-preflight`；同页多图有语义关系时补 `group-fit-preflight`。
+
+### 阶段 4 只能从骨架开始（硬约束，这是关键机制）
+
+```bash
+python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/deckplan2slide.py" \
+  --plan deck_plan.json --rpa-root $RPA --out slides/ --node $NODE
+```
+
+- 没有 `deck_plan.json`，或 `pipeline_status != plan_complete` → **退出码 1，一个页面都不给生成**
+- 输出 `slides/NN.slide`：slot 几何取自 `slot_specs[].pptx_in`（×96 转 px），按 `reading_order` 摆好，附 C 区页脚
+- 输出 `slides/_slots.md`：每页每 slot 的 `max_chars` / `max_lines` / 字号 hint
+- **填内容时严格照 `_slots.md` 的容量写**，超了会被判 `CAPACITY_EXCEEDED`
+
+这套机制把 RPA 从「可跳过」变成「绕不过」：不跑 plan → 没有 layout_id → 没有骨架 → 无法渲染。
+实测生成的 13 页骨架 `slidep-validate` 13/13 通过。
+
+改页数时先改 `briefs.json` 的条数再重跑 plan（`--slide-count` 是目标不是填充），
+然后删掉旧 slides/ 重新生成骨架。
+
+---
+
 ## 阶段 1　paperworkflow：PDF → workflow.json
 
 **1a. 列候选**（用户没指定论文时先调这个）
@@ -333,6 +439,13 @@ paperworkflow 同理，python 换成 `F:/Workbuddy/Total-pipe/paperworkflow/.ven
 | `does not resolve to Evidence` | `evidence_ids` 里 id 拼错或不在注册表 | 对照 `workflow.json` 的 `evidence_registry` |
 | 版面选得很怪、但没报错 | `category_hint` 不是合法 id | `pwf2rpa_list_categories` 查真名后改 |
 | `CAPACITY_EXCEEDED` | 文本超出该分类最宽版面 | 缩短文本，或换容量更大的分类 |
+| `CAPACITY_EXCEEDED` 报 `1 visual(s) but only 0 figure slot(s)` | `metrics` / `chart_takeaway` 两类版面**只吃图表、不吃图片**（`image_capacity=0`, `chart_capacity=1~2`） | 去掉该 brief 的 `visuals`，或换到支持图的 `experiment` / `background` / `method_overview` / `figure_text` |
+| `CATEGORY_CROWDED` | 同分类里能装下的版面已被前面几页占完，RPA 不复用版面 | 缩短该页让更多变体可用，或换一个 category（实测把「良率均匀性」从 `metrics` 挪到 `method_overview` 即消解） |
+| `visual-fit-preflight` 报 `visual_container.content_bbox must equal the inner allocated_visual_bbox` | `content_bbox` 与 `allocated_visual_bbox` 不一致 | 干脆**别传** `content_bbox`，只传 `outer_bbox` + `container_id` |
+| `visual-fit-preflight` 报 `aspect_ratio_mismatch`、面积占比 <20% | 版面给的图槽长宽比与源图差太远（典型：流程类版面的窄条图槽塞方图） | 按脚本给的替代版面改该页 `category_hint`；或允许语义裁切时先跑 `figure-placement` 裁子图 |
+| 读图尺寸报 "not png" / "unsupported image" | **扩展名不可信**：paperworkflow 抽出的图是 `.jpg` 内容，复制成 `assets/*.png` 后按扩展名解析必崩 | 按 magic bytes 嗅探（`\x89PNG` / `\xff\xd8`），别信后缀 |
+| `preflight` 报 `NON_CANONICAL_PAGE_NAME` | 页面文件名只有两位序号（`01.slide`），缺语义后缀 | 改成 `01_cover.slide` / `02_method.slide`；页序稳定性依赖它 |
+| briefs 加到 N 条但 `plan --slide-count N` 仍只出旧页数 | `--slide-count` 是**目标**不是填充，页数由 `rpa_input.json` 里的 briefs 条数决定 | 先把 `briefs.json` 补到 N 条 → `pwf2rpa_convert` → 再 `plan` |
 | 副牌后段页数被挤掉 | RPA 不在同一副牌内复用了版面 | 减少同类短页，或降低 `slide_count` |
 | `synthesis_readiness` 不通过 | 证据暴露/覆盖不足，不是 OCR 问题 | 回到阶段 1 补 `queries` 重跑 |
 | 遥测报白字对比度 1.x，但肉眼看着没问题 | 文字框**几何溢出**了背后的色块（如徽章胶囊 26px 高、文字框 36px 高），背景解析回退到页底色 | 让色块显式 `height` + flex 居中，或加大内边距，**别改配色** |
@@ -367,3 +480,42 @@ RPA `assets/layout-library/layouts.json` 的 `version` 一致（当前都是 2.0
 
 改完跑：`node scripts/check-version.mjs` + `node --test`（当前 230 全绿）。
 仓库有远端 `origin`，但**默认只 commit 不 push**，要推需用户明确说。
+
+## 渲染层返工（加页 / 改结构）后的回补清单
+
+在第 4 段（slidep 渲染）手工加页或大改结构后，**前 3 段的产物会集体过期**。不回补的话，
+碰撞/对比度 QA 仍能跑（不依赖 layout_id），但规划与成品脱节，QA 摘要里会出现 `layout_id: None`。
+
+每次加页后至少回补这 4 项：
+
+| # | 回补项 | 命令 / 动作 | 不做会怎样 |
+|---|---|---|---|
+| 1 | 重跑 RPA plan 对齐页数 | `plan --slide-count <N>`（N = 实际页数） | `deck_plan.json` 停留在旧页数，QA 无布局基准 |
+| 2 | 同步 `STORY.md` | 页面大纲 / rhythm 曲线 / 页数全部改成 N | story 与成品对不上，后续返工失去参照 |
+| 3 | 同步 `DESIGN.md` | 「2.4 每页配色分配」「6. 母版组件清单」补到 N 页 | 新增页无配色分配约束，风格易飘 |
+| 4 | 清理中间文件 | `_v2.pptx` / `_rebuild.pptx` / `deck_plan_cm.json` / `~$*.pptx` | 目录里堆几百 KB 无用文件 |
+
+## 组件覆盖率门禁（收工前必跑，硬门禁）
+
+光靠自觉扫一遍没用——实测会漏。**收工前必须跑脚本**，有 FAIL 就不许交付：
+
+```bash
+python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_audit.py" \
+  --project <PPT项目目录> --plan <deck_plan.json>
+```
+
+退出码 0 = 放行；1 = 有 FAIL。`--json` 可拿结构化结果。
+
+它自动查 10 项：`pptx_pages` / `plan_pages` / `plan_freshness` / `story_pages` /
+`design_pages` / `table_component` / `component_coverage` / `evidence_trace` /
+`asset_usage` / `residue_files`。
+
+手搭表格的检测特征是「深蓝表头行 + `borderTop:'none'` 拼出的斑马纹行」，
+命中即 FAIL 并指出是哪几页。若要新增检测（比如别的组件漏用），直接往脚本里加 check 函数。
+
+### 各段容易漏用的能力（跑完门禁后对照看）
+
+- **paperworkflow**：只调 `literature_workflow` 就够出证据，但 `process_pdf` / `outline` / `search_evidence` / `prompt_builder` 常整段未用。若 `synthesis_readiness` 卡在 review 门，应回到这里补 `queries` 而不是硬过。
+- **pwf2rpa**：默认兜底 briefs 常质量不佳（占位标题），人工重写后它就退化成**纯格式校验器**。重写 briefs 是合理的，但要清楚此时 `convert` 的自动映射价值≈0。
+- **research_ppt**：有 20 个 MCP 工具 + 20 个 CLI 命令，通常只用 `normalize-content` / `plan` / `validate-deck` 三个。版面库 320 个版面、以及 `preflight` / `figure-placement` / `group-fit-preflight` / `visual-fit-preflight` / `visual-quality` 这一串**渲染前预检**经常被跳过——而它们恰好是防碰撞的第一道闸。
+- **tencent-pptx**：组件有 14 个（box/text/image/**table**/chart/diagram/svg/faicon/math/codeblock/qrcode/hyperlink/animation/slide），实际常只用 4 个。表格类页面**务必用 `component-table.md` 的原生 Table**，不要用 Box+Text 手搭——手搭会被 QA 判 `EXCESSIVE_WHITESPACE`，且对齐难控。
