@@ -1,0 +1,260 @@
+# ============================================================================
+# Total-pipe 多 Agent 编排骨架
+# 流水线：paperworkflow(证据) → pwf2rpa(简报) → research_ppt(规划) → 渲染 → 遥测QA
+# 三条切分轴（设计地基，任何改动不得违背）：
+#   1. 模态边界 —— 只有「读论文图」与「渲染眼检」两处需要看图，其余单模态。
+#   2. 规则 vs 判断 —— 确定性校验用工具直调，绝不包给 LLM agent（LLM 会"假装通过"）。
+#   3. 智力分配 —— 碰语义/视觉判断用强模型；碰结构/状态用轻模型或零 LLM。
+# ============================================================================
+
+meta:
+  name: total-pipe-multi-agent
+  version: "1.0"
+  pipeline: [paperworkflow, pwf2rpa, research_ppt, render, telemetry]
+  principle:
+    - "多模态 agent 只管两件'看'的活：读论文图、眼检渲染结果"
+    - "单模态 agent 管文本与结构化；确定性校验全部留给工具"
+    - "谁碰真值谁说话，碰不到真值的一律别当守卫"
+
+# 智力分级（融合进每个 agent 的 intelligence + model 字段）
+intelligence_legend:
+  L0:
+    model: none
+    desc: "纯确定性代码，零 LLM。用于校验/遥测，工具直调"
+  L1:
+    model: lite
+    desc: "轻量单模态，快、便宜、守规矩。用于调度与写 DSL"
+  L2:
+    model: default
+    desc: "标准单模态，语义压缩/取舍与科学内容展开。用于简报撰写与渲染"
+  L3:
+    model: reasoning
+    desc: "强多模态推理，看图 + 跨模态判断。只给两个看图岗"
+    note: "需视觉能力，成本与延迟最高，集中投放不摊薄"
+
+# ============================================================================
+# Agents
+# ============================================================================
+agents:
+
+  # --------------------------------------------------------------------------
+  - id: orchestrator
+    name: "编排 Orchestrator"
+    modality: single
+    intelligence: L1
+    model: lite
+    objective: "读契约、调度各 agent、卡硬门槛；不产出任何内容"
+    prompt:
+      role: "你是流水线编排者，不创作内容，只做调度与门槛判定"
+      inputs: "workflow.json 路径 + 各阶段产物路径 + 本 team.yaml 契约"
+      output_contract: "只输出调度决策与门槛判定结果（pass/block/retry），不改写任何交接物"
+      hard_constraints:
+        - "门槛断言一律机械执行，不凭印象放行"
+        - "任何 gate 返回 fail 时必须 block 并把违规明细透传给对应 agent，禁止自行修补"
+      forbidden:
+        - "不得产出 slide 文案、briefs、DSL 等任何内容"
+        - "不得把 warning 美化成通过"
+    input_schema:
+      workflow_json: { type: path, required: true, desc: "PaperWorkflow v4 产物，含 evidence_registry/outline" }
+      artifact_paths: { type: map, required: true, desc: "各阶段产物路径（rpa_input/deck_plan/pptx/qa_summary）" }
+    output_schema:
+      decision: { type: enum, enum: [pass, block, retry], desc: "本轮调度结论" }
+      gate_results: { type: array, desc: "每条门槛的 assert 结果与证据" }
+    gates:
+      - { id: normalize_valid, assert: "$normalize.status == 'valid' && $normalize.violations == []", on_fail: block }
+      - { id: plan_complete, assert: "$plan.pipeline_status == 'plan_complete'", on_fail: block }
+      - { id: preflight_ok, assert: "$preflight.status != 'invalid'", on_fail: block }
+      - { id: qa_clean, assert: "$qa.deck.error_count == 0 && $qa.deck.fail_count == 0", on_fail: block }
+    note: "若门槛只剩布尔判断，可直接降级为纯 if 代码（L0），连 lite 都不用"
+
+  # --------------------------------------------------------------------------
+  - id: evidence-extractor
+    name: "证据提取 Evidence Extractor"
+    modality: multimodal
+    intelligence: L3
+    model: reasoning
+    objective: "论文 PDF → evidence_registry，产出图文关联（哪张图对应哪条结论）"
+    prompt:
+      role: "你是多模态证据提取器，必须真正看图"
+      inputs: "论文 PDF + images/ 目录 + full_ocr_markdown.md"
+      output_contract: "evidence_registry：每条证据含 evidence_id/text/source_lines/chunk_id + 显式 figure 引用与 caption"
+      hard_constraints:
+        - "figure 引用必须能解析到 images/ 下的真实文件路径，caption 必须来自论文图注"
+        - "图↔结论的关联必须由视觉内容判定，不得仅凭文本猜测"
+      forbidden:
+        - "不得编造证据、凭空造 caption、虚构 source_lines"
+    input_schema:
+      pdf: { type: path, required: true, desc: "源论文" }
+      images_dir: { type: path, required: true, desc: "论文提取图目录" }
+      ocr_markdown: { type: path, required: true, desc: "全文 OCR" }
+    output_schema:
+      evidence_registry: { type: json, required: true, desc: "证据数组，含 figure 引用与 caption" }
+      figure_map: { type: json, required: true, desc: "图文件名 ↔ 图编号 ↔ 结论 的映射" }
+    gates:
+      - { id: figure_resolvable, assert: "每条 figure 引用均指向 images/ 下真实存在的文件", on_fail: block }
+      - { id: association_closed, assert: "figure_map 覆盖论文所有图表且无孤儿结论", on_fail: block }
+
+  # --------------------------------------------------------------------------
+  - id: brief-author
+    name: "简报撰写 Brief Author"
+    modality: single
+    intelligence: L2
+    model: default
+    objective: "evidence → briefs.json，显式带图（visuals 手写，不依赖兜底），并写完整正文 body"
+    prompt:
+      role: "你是简报撰写者，把证据写成逐页 brief（含完整正文 body）"
+      inputs: "evidence_registry + evidence.md + figure_map（图已由上游标好 caption）"
+      output_contract: "briefs.json：每页 title/category_hint/claims/body/visuals[{image,caption}]/takeaway；body 写完整科学论证段落（≥40字）"
+      hard_constraints:
+        - "visuals 必须显式填 image 路径与 caption；兜底 briefs image_count=0 会丢图，禁止依赖"
+        - "每张论文图至少挂到一页；caption 沿用 evidence 的 caption，不得改写"
+        - "content-heavy 页（theory/case/discussion/limitations/method_overview/question/background）必须写 body 完整段落，不能只留 claims 标签"
+      forbidden:
+        - "不得写无证据支撑的 claims"
+        - "不得遗漏 figure_map 中任何一张图"
+    input_schema:
+      evidence_registry: { type: json, required: true, desc: "上游证据，含图引用" }
+      figure_map: { type: json, required: true, desc: "图↔结论映射" }
+    output_schema:
+      briefs_json: { type: json, required: true, desc: "逐页 brief，visuals 显式带图" }
+    gates:
+      - { id: image_count_matches, assert: "每页 image_count == visuals 数组长度", on_fail: block }
+      - { id: figure_all_placed, assert: "figure_map 全部图已挂到 briefs 中", on_fail: block }
+      - { id: pwf2rpa_clean, assert: "$pwf2rpa_check.warning_count == 0", on_fail: retry }
+
+  # --------------------------------------------------------------------------
+  - id: renderer
+    name: "渲染 Renderer"
+    modality: single
+    intelligence: L2
+    model: default
+    objective: "deck_plan → .slide DSL → pptx；plan 驱动版式，正文科学内容从 body/evidence 展开（不锁死在碎片槽位），并维护学术主题的版式丰富度"
+    prompt:
+      role: "你是渲染器：版式结构照 deck_plan 的 layout_id/category 落地，但正文科学内容用 brief 的 body/evidence 展开成完整论证，不写标签碎片"
+      inputs: "deck_plan.json（含每页 layout_id/category + text 槽的 body 正文）+ evidence.md + images/"
+      output_contract: ".pptx + 逐页 .slide 源文件；版式由 plan 决定，正文由 body 展开"
+      hard_constraints:
+        - "plan 的 layout_id/category 必须落到真实页面，禁止当'参考'另写一套版式"
+        - "正文渲染 brief 的 body 完整段落（≥40 字），不得退化成 ≤16 字的标签碎片"
+        - "slidep-validate 逐页 success 后才 upsert"
+        - "维护版式丰富度：主题色块、语义徽章、页脚/页码等设计元素必须保留，不得全局洗成纯白"
+      forbidden:
+        - "不得偏离 plan 版式自创布局"
+        - "不得在交付页残留溯源元数据（如 EV 编号）"
+        - "不得因追求'简洁'把正文压缩成一句话、把主题色块/徽章删掉"
+    input_schema:
+      deck_plan: { type: path, required: true, desc: "含 slides[].layout_id/category + slot_assignments 里的 body 正文" }
+      evidence_md: { type: path, required: true, desc: "科学论证素材（中文化展开的 body 与证据）" }
+      images_dir: { type: path, required: true, desc: "论文图" }
+    output_schema:
+      pptx: { type: path, required: true, desc: "渲染产物" }
+      slide_sources: { type: array, required: true, desc: "逐页 .slide 文件" }
+    gates:
+      - { id: validate_all_pass, assert: "slidep-validate 每页 success==true", on_fail: block }
+      - { id: layout_driven, assert: "每页实际 layout_id 与 plan 一致", on_fail: block }
+      - { id: media_present, assert: "images 全部进入 ppt/slides/media/", on_fail: block }
+      - { id: body_rendered, assert: "每页正文槽渲染了 brief 的 body（非占位符/非 ≤16 字标签）", on_fail: retry }
+
+  # --------------------------------------------------------------------------
+  - id: qa-inspector
+    name: "质量把关 QA Inspector"
+    modality: multimodal
+    intelligence: L3
+    model: reasoning
+    note: "拆两半——遥测(规则, L0)用 run_qa.py 直跑；眼检(看图, L3)才动多模态模型"
+    objective: "真实 pptx → OOXML 遥测(规则) + 渲染眼检(看图)；抓违规并回喂修复"
+    prompt:
+      role: "你是质量把关者，遥测交给规则引擎，你只负责机器判不了的视觉判断"
+      inputs: "真实 pptx + deck_plan.json(注入 layout_id/category) + 遥测违规明细 + 逐页 PNG"
+      output_contract: "QA summary：每页 pass / manual_review / fail + 违规明细(证据等级) + 修复建议"
+      hard_constraints:
+        - "OOXML 遥测必须读真实 pptx 的几何(measured_ooxml)，layout_id 是 --plan 注入(derived)，如实标注"
+        - "图内 raster 字清晰度/遮挡用导出 PNG 眼检判断"
+      forbidden:
+        - "不得把 manual_review_required 美化成 pass"
+        - "不得把 derived 证据冒充 measured"
+        - "不得把 blocked(关键事实缺失) 降级为 pass"
+        - "不得为消除对比度/留白警告而让 renderer 全局统一色、洗成纯白——那会把主题色块/徽章冲淡"
+    input_schema:
+      pptx: { type: path, required: true, desc: "真实交付物" }
+      deck_plan: { type: path, required: true, desc: "注入 layout_id/category" }
+      declared_evidence: { type: json, required: true, desc: "brief 声明的 evidence_ids + body 正文，喂给覆盖回归与正文深度" }
+    output_schema:
+      qa_summary: { type: json, required: true, desc: "逐页状态 + 违规明细 + 证据等级" }
+      violations: { type: array, required: true, desc: "对比度/碰撞/图宽/正文深度(TEXT_SPARSITY)等违规" }
+    gates:
+      - { id: zero_error, assert: "$qa.deck.error_count == 0 && $qa.deck.fail_count == 0", on_fail: retry }
+      - { id: coverage_closed, assert: "$qa.deck.evidence_coverage_gap == []", on_fail: retry }
+      - { id: text_sparsity_clean, assert: "$qa.deck.text_sparsity_invalid_slides == []", on_fail: retry }
+      - { id: manual_review_closed, assert: "所有 manual_review 页均已眼检闭环", on_fail: block }
+
+# ============================================================================
+# 规则引擎（非 agent，L0，工具直调 —— 严禁包给 LLM）
+# ============================================================================
+tools:
+  - id: pwf2rpa_check
+    desc: "干跑校验 briefs 槽位与容量，抓 warning"
+  - id: pwf2rpa_convert
+    desc: "briefs → rpa_input.json"
+  - id: normalize-content
+    desc: "内容模型规范化，输出 status + violations + coverage"
+  - id: plan
+    desc: "生成 deck_plan.json，输出 pipeline_status + design_score"
+  - id: validate-deck
+    desc: "deck_plan 结构校验 + 与 content_model 交叉核验"
+  - id: preflight
+    desc: "渲染前检查，含文件系统真验证（假文件名必须拦）"
+  - id: slidep-validate
+    desc: ".slide DSL 语法门（语法≠视觉，视觉真值归遥测）"
+  - id: pptx_sidecars
+    desc: "解析真实 pptx OOXML → sidecar（注入 layout_id/category）"
+  - id: run_qa
+    desc: "遥测 QA 链：assemble-render-telemetry → visual-quality → validate-rendered-deck"
+
+# ============================================================================
+# 交接契约（每条对应一次真实踩坑，断真值即断链）
+# ============================================================================
+handoffs:
+  - { from: evidence-extractor, to: brief-author,
+      deliverable: "figure 引用显式带图 + caption 落地",
+      truth_source: "figure_map 指向 images/ 真实文件",
+      pitfall: "兜底 briefs 不带图，6 张图差点全丢" }
+  - { from: brief-author, to: tools.pwf2rpa_check,
+      deliverable: "source_files 与磁盘文件名一致",
+      truth_source: "preflight 文件系统真验证",
+      pitfall: "假文件名 slides/01_cover.slide 曾判 valid（已修）" }
+  - { from: tools.plan, to: renderer,
+      deliverable: "plan 的 layout/category 驱动渲染",
+      truth_source: "实际渲染页 layout_id 与 plan 一致",
+      pitfall: "plan 只当参考，版式靠手写 DSL" }
+  - { from: renderer, to: qa-inspector,
+      deliverable: "QA 吃真实 pptx 的 OOXML + 喂 declared_evidence",
+      truth_source: "measured_ooxml 几何 + 证据覆盖回归",
+      pitfall: "EV0008 丢失无人拦（已补回归）" }
+
+# ============================================================================
+# 修复循环（QA 是体检 + 治病，不是只出报告）
+# ============================================================================
+repair_loop:
+  trigger: "qa-inspector 产出 error/fail 违规明细"
+  steps:
+    - "违规明细回喂 renderer"
+    - "renderer 改 .slide DSL → slidep-validate → upsert"
+    - "重跑 pptx_sidecars + run_qa 遥测"
+    - "循环直到 0 error / 0 fail"
+  max_rounds: 5
+  on_exhaust: "block 并报告未收敛违规，交人工"
+
+# ============================================================================
+# 门槛执行顺序（Orchestrator 机械执行）
+# ============================================================================
+gate_order:
+  - pwf2rpa_check_dry_run    # warning_count == 0
+  - pwf2rpa_convert          # 产出 rpa_input.json
+  - normalize                # status=valid 且 violations=[]
+  - plan                     # pipeline_status=plan_complete
+  - validate_deck            # 含 content_model 交叉核验
+  - preflight                # status != invalid（含文件系统真验证）
+  - render                   # slidep-validate 全 success
+  - telemetry_qa             # 0 error / 0 fail
+  - manual_review_close      # manual_review 页眼检闭环
