@@ -153,6 +153,49 @@ def gradient_hexes(el):
     return [c.get("val") for c in grad.findall(".//a:gs/a:srgbClr", NS) if c.get("val")]
 
 
+VISUAL_TYPE_MIN_WIDTH = {
+    "photo": 0.25, "visual_evidence": 0.34, "schematic": 0.36, "simple_plot": 0.36,
+    "composite_figure_region": 0.42, "dense_plot": 0.50,
+    "multi_panel_figure": 0.55, "table_screenshot": 0.55,
+}
+# 光栅文字高度启发式：学术图坐标轴刻度约占图高的 8%（实测本文声子色散图
+# 880→ 刻度 ~20px/232px≈8.6%，旋转坐标图文字占比更高）。渲染后文字高度 =
+# 显示高度 × 该比例。缺省 8%，可用 --embedded-text-ratio 按素材微调。
+DEFAULT_EMBEDDED_TEXT_RATIO = 0.08
+# 可达宽度按元素框算，而 RPA 比较的是 contain 适配后的实际图像宽度（略窄于框），
+# 1% 余量覆盖这部分留白与 EMU→px 量化误差，否则边界相等会被判成不足。
+LAYOUT_TOLERANCE = 0.99
+
+
+def row_mates(target, elements):
+    """Return image elements sharing a row with target (y-overlap > half the shorter height)."""
+    ty, th = target["bbox"][1], target["bbox"][3]
+    mates = []
+    for e in elements:
+        if e.get("kind") != "image":
+            continue
+        oy, oh = e["bbox"][1], e["bbox"][3]
+        if min(ty + th, oy + oh) - max(ty, oy) > 0.5 * min(th, oh):
+            mates.append(e)
+    return mates
+
+
+def layout_reachable_width(target, mates):
+    """Width a figure can actually reach under its layout, in px.
+
+    Images on the same row split the row span minus the gaps between them. A
+    single image can already occupy its full box, so its own width is the cap.
+    """
+    if len(mates) <= 1:
+        return float(target["bbox"][2])
+    ordered = sorted(mates, key=lambda e: e["bbox"][0])
+    span = max(e["bbox"][0] + e["bbox"][2] for e in ordered) - ordered[0]["bbox"][0]
+    widths = sum(e["bbox"][2] for e in ordered)
+    n = len(ordered)
+    gap = max((span - widths) / (n - 1), 0.0)
+    return (span - gap * (n - 1)) / n
+
+
 def parse_slide(z, n, rels_map, slide_bg):
     root = ET.fromstring(z.read(f"ppt/slides/slide{n}.xml"))
     elements, registry = [], []
@@ -346,6 +389,11 @@ def main():
     ap.add_argument("--contract", default="0.4.7")
     ap.add_argument("--plan", help="deck_plan.json for layout_id/category enrichment")
     ap.add_argument("--embedded-text", default="true", help="paper figures carry raster text")
+    ap.add_argument("--visual-type", default="dense_plot",
+                    choices=sorted(VISUAL_TYPE_MIN_WIDTH),
+                    help="figure class driving the base minimum display width")
+    ap.add_argument("--embedded-text-ratio", type=float, default=DEFAULT_EMBEDDED_TEXT_RATIO,
+                    help="smallest raster text height as a fraction of the rendered figure height")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     z = zipfile.ZipFile(args.pptx)
@@ -393,18 +441,45 @@ def main():
             aid = el["asset"]["assetId"]
             registry[aid] = el["assetSha256"]
             key = el["visual_key"]
+            has_text = args.embedded_text.lower() == "true"
+            base_required = VISUAL_TYPE_MIN_WIDTH.get(args.visual_type, 0.34)
+            mates = row_mates(el, elements)
+            reachable = layout_reachable_width(el, mates)
+            reach_norm = reachable / 1280.0
+            constrained = reach_norm < base_required
+            # 版面受限时按版面能力定阈值：双图并列的槽位物理上放不出 dense_plot
+            # 要求的 0.50 版宽，继续按 0.50 判只会刷出无法修复的告警。
+            # LAYOUT_TOLERANCE 留出量化余量，避免边界相等被判为不足。
+            min_display_width = round(
+                base_required if not constrained else reach_norm * LAYOUT_TOLERANCE, 4)
+            text_px = round(el["bbox"][3] * args.embedded_text_ratio, 2) if has_text else None
             entry = {
                 "visual_key": key, "slide_id": f"sl/pptx-{n:02d}",
                 "description": f"embedded paper figure {key}",
                 "slot_id": key, "container_id": el["name"], "group_id": None,
                 "sibling_index": None, "source_visual_id": key, "region_id": None,
-                "visual_type": "dense_plot", "panel_count": 1,
-                "has_embedded_text": args.embedded_text.lower() == "true",
+                "visual_type": args.visual_type, "panel_count": 1,
+                "has_embedded_text": has_text,
                 "source_width_px": el["asset"]["width"],
                 "source_height_px": el["asset"]["height"],
                 "asset_sha256": el["assetSha256"],
                 "crop_mode": el["crop_mode"], "source_region": el["source_region"],
                 "coordinate_space": "source_normalized_0_1",
+                "min_display_width": min_display_width,
+                "layout_reachability": {
+                    "row_image_count": len(mates),
+                    "reachable_width_px": round(reachable, 1),
+                    "reachable_width_norm": round(reach_norm, 4),
+                    "visual_type_required_width": base_required,
+                    "layout_constrained": constrained,
+                },
+                "rendered_embedded_text_px": text_px,
+                "raster_text_measurement": {
+                    "status": "estimated" if has_text else "not_applicable",
+                    "method": "display_height_times_text_ratio",
+                    "text_height_ratio": args.embedded_text_ratio,
+                    "min_height_px": text_px,
+                },
             }
             if el["crop_mode"] == "preprocessed_fixed_region":
                 entry.update({

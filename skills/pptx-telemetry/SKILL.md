@@ -103,8 +103,20 @@ glob 整个目录，混入旧前缀文件会把同页跑两遍、deck 页数翻�
   （0.4375 过、0.297 挂）。
 - `EXCESSIVE_WHITESPACE`(warning)：封面留白大可接受。
 - `SCIENTIFIC_VISUAL_NOT_EVALUABLE`(info) + assemble `manual_review_required`：
-  图内 raster 字无像素度量，**不能当通过**——用 `slidep-export-images` 逐页
-  PNG 眼检核对并如实报告（本 skill 无法机器闭环这一项）。
+  **已通过 sidecar 补测消除**。sidecar 现在为每个 visual 写
+  `rendered_embedded_text_px`（= 显示高度 × `--embedded-text-ratio`，默认 0.08，
+  即学术图坐标刻度约 8% 图高）、`min_display_width`（版面可达宽）与
+  `layout_reachability`（含同排图数/可达 px/是否受限）。RPA 读到后不再报
+  NOT_EVALUABLE。光栅文字高度是**启发式估算**：`--embedded-text-ratio` 可按素材
+  微调（实测声子色散刻度文字约 8.6%），拿不准的仍用 `slidep-export-images` 渲染
+  核对，**不要 100% 信任估算值**。补充：放大 2 倍的图（upscale）文字虽然数值可读
+  但会模糊，此规则不覆盖，需另查。
+- 图宽阈值**按版面自适应**：双图并列页的槽位物理上放不出 dense_plot 要求的 0.50
+  版宽，全部按 0.50 判会刷出无法修复的 `VISUAL_READABILITY_RISK`。sidecar 按同排
+  扣 gap 后平分排跨度算 `reachable_width_px`，版面受限时把 `min_display_width`
+  下调到该值（乘 `LAYOUT_TOLERANCE=0.99` 覆盖 contain 留白），从而不误报
+  「图太小」。参数：`--visual-type`（默认 dense_plot，可选 photo/schematic/
+  simple_plot 等）。
 - `ELEMENT_COLLISION`(skill-local, **不在 RPA CLI 规则集内**)：pairwise
   element-bbox 碰撞检测，覆盖 RPA 缺的版面对撞规则。`scripts/pairwise_collision.py`
   跑在 visual-quality 之后，被 `run_qa.py` 自动调用。结果汇入每页
