@@ -78,6 +78,15 @@ glob 整个目录，混入旧前缀文件会把同页跑两遍、deck 页数翻�
 2. 形状 name/descr 带 slidep 模板元数据；descr 里有 JSX 源（背景色来源）。
 3. 文本普遍 `wrap="none"` 且按单行精确裁箱 → 行高模型必须用 1.2em，用
    asc+desc(≈1.32em) 会全页误报 TEXT_VISUAL_OVERFLOW。
+4. `borderTop/bottom/...` 渲染成 `<a:custGeom>` 细线，其 **bbox 是整条边框带**但
+   实际只填了 ~2% 的窄条。sidecar 用 `cust_geom_fill_ratio`（shoelace 面积÷(w·h)）
+   识别，`fill_area_ratio<0.5` 的边框形状**不当作文字背景面板**，否则 header
+   标题字（`#4A5568`/`#1E4FA8` 白底）会被误判成坐在 `#0E3F8C` 上 → 22 处假 1.3:1。
+5. 表格/图表渲染成 `<p:graphicFrame>`（不是 `p:sp`），且其变换在 `<p:xfrm>`
+   （不是 `<a:xfrm>`）。sidecar 已解析 graphicFrame（取 bbox + `<a:t>` 文本摘要
+   记为 `kind="table"` content），否则表格页会被当成大段空白 → 假
+   EXCESSIVE_WHITESPACE/LARGE_VERTICAL_VOID。注意：表格单元格颜色暂不测对比度
+   （会报 CONTRAST_NOT_EVALUABLE，需手工核对表格文字对比度）。
 
 ## 硬契约（实测咬人）
 
@@ -93,7 +102,13 @@ glob 整个目录，混入旧前缀文件会把同页跑两遍、deck 页数翻�
 4. **文字背景严格取元素 fillColor**（适配器无 z 序合成）：叠字元素把 z 序解析
    出的**最小包含面板**色写入 `fillColor`，加 `fill_provenance` 披露。不解析
    会把白字坐深蓝面板误报 1.0，也会漏掉白字坐浅色面板的真问题。注意取
-   最小包含面板，取最大面积会选错层。
+   最小包含面板，取最大面积会选错层。**边框细线（custGeom）除外**——见特例 4。
+5. **细装饰线必须声明 `relation`**，否则 RPA `decorative_element_relations` 报
+   `ORPHAN_DECORATIVE_ELEMENT`(error)。sidecar 已自动为「比例≥18 且面积≤2% 页、
+   且被某个填充面板包含」的细线合成 `relation={type:"annotation",target_id:<面板aid>}`
+   （能带图里的导带/价带线、卡片里的分隔线都靠这个消孤儿）。`relation.type` 只认
+   枚举 `title_rule|container_border|flow_connector|annotation|decorative_peer|baseline_preserved`
+   ——写 `container` 会直接被 render_telemetry 的 input schema 拒掉（McpInputSchemaError）。
 
 ## QA 阈值（实测）
 
@@ -150,5 +165,9 @@ glob 整个目录，混入旧前缀文件会把同页跑两遍、deck 页数翻�
 | DISPLAY_GEOMETRY_MISMATCH | 声明了 effectiveDisplayBbox；删掉让 profile 推导 |
 | 全页 TEXT_VISUAL_OVERFLOW | 行高模型不是 1.2em，或对 wrap=none 判了溢出 |
 | 低对比误报 1.0 | 叠字元素没写 z 序解析的面板色到 fillColor |
-| deck 页数翻倍 | sidecars 目录混入旧前缀文件；清目录重跑 |
+| 标题/页码字被报成坐在深色面板(1.3:1) | header 用 borderBottom；已修——custGeom 边框细线不再当面板（特例 4） |
+| 表格页报 EXCESSIVE_WHITESPACE/LARGE_VERTICAL_VOID | graphicFrame 没被解析；已修——表格记为 content（特例 5） |
+| ORPHAN_DECORATIVE_ELEMENT 刷屏 | 细装饰线缺 relation；已修——容器内细线自动合成 annotation 关系（硬契约 5） |
+| McpInputSchemaError: relation.type not allowed | 写了 `container`；枚举只认 title_rule/container_border/flow_connector/annotation/decorative_peer/baseline_preserved |
+| deck 页数翻倍 | ① sidecars 目录混入旧前缀文件，清目录重跑；② `slidep upsert-dsl` 默认 `--page-index=-1` 是**追加**不是覆盖——重写某页要删 pptx 重建（create + 按序 upsert 全部页） |
 | ELEMENT_COLLISION 误报 | 含容过滤未识别——可能 z 序分层（前景盖背景）但 bbox 不是父子关系；可调 pairwise_collision.py 的 CONTAIN_TOL_PX 或加 z 序豁免 |

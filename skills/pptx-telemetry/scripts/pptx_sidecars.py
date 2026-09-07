@@ -116,6 +116,11 @@ def resolve_background(el, elements, slide_bg):
     for u in elements:
         if u["order"] >= el["order"] or not u.get("fillColor"):
             continue
+        # skip thin border shapes (custGeom with a ~2% filled sliver): their full bbox
+        # is not actually painted, so they are not a real background panel.
+        far = u.get("fill_area_ratio")
+        if far is not None and far < 0.5:
+            continue
         ux, uy, uw, uh = u["bbox"]
         if ux <= bx[0] and uy <= bx[1] and ux + uw >= bx[0] + bx[2] and uy + uh >= bx[1] + bx[3]:
             cands.append(u)
@@ -151,6 +156,37 @@ def gradient_hexes(el):
     if grad is None:
         return []
     return [c.get("val") for c in grad.findall(".//a:gs/a:srgbClr", NS) if c.get("val")]
+
+
+def cust_geom_fill_ratio(spPr):
+    """Filled-path area / bbox area for a custGeom shape (unitless), or None for prstGeom.
+
+    slidep renders borders (borderTop/bottom/left/right) as a custGeom whose path is
+    a thin sliver (e.g. a 1px bottom rule inside a full-height box): the shape's bbox
+    is the whole band but only a ~2% sliver is actually filled. Such shapes must NOT be
+    treated as a solid background panel for text contrast. We return the shoelace area
+    of the path divided by (path w x h); a full rectangle is 1.0, a thin rule ~0.02.
+    """
+    if spPr is None:
+        return None
+    cg = spPr.find("a:custGeom", NS)
+    if cg is None:
+        return None
+    path = cg.find(".//a:path", NS)
+    if path is None:
+        return 0.0
+    w = float(path.get("w", 1.0)) or 1.0
+    h = float(path.get("h", 1.0)) or 1.0
+    pts = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in path.findall(".//a:pt", NS)]
+    if len(pts) < 3:
+        return 0.0
+    area = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        area += x1 * y2 - x2 * y1
+    area = abs(area) / 2.0
+    return area / (w * h)
 
 
 VISUAL_TYPE_MIN_WIDTH = {
@@ -203,10 +239,10 @@ def parse_slide(z, n, rels_map, slide_bg):
     spTree = root.find(".//p:cSld/p:spTree", NS)
     for sp in spTree:
         tag = sp.tag.split("}")[-1]
-        if tag not in ("sp", "pic"):
+        if tag not in ("sp", "pic", "graphicFrame"):
             continue
         order += 1
-        xfrm = sp.find(".//a:xfrm", NS)
+        xfrm = sp.find(".//a:xfrm", NS) or sp.find(".//p:xfrm", NS)
         off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
         x, y, w, h = emu(off.get("x")), emu(off.get("y")), emu(ext.get("cx")), emu(ext.get("cy"))
         cnv = sp.find(".//p:cNvPr", NS)
@@ -215,6 +251,20 @@ def parse_slide(z, n, rels_map, slide_bg):
             "scope": "slide", "aid": f"sh/pptx-{n}-{order}", "id": str(order),
             "name": f"el-{n}-{order}", "bbox": [x, y, w, h], "geometry": "rect",
         }
+        if tag == "graphicFrame":
+            # Tables / charts render as graphicFrame, not p:sp. Capture the bbox and a
+            # text digest so they count as content — otherwise the sidecar sees a
+            # phantom whitespace gap where the table actually sits.
+            tbl = sp.find(".//a:tbl", NS)
+            if tbl is not None:
+                cell_texts = [t.text or "" for t in tbl.findall(".//a:t", NS)]
+                el["kind"] = "table"
+                el["text"] = " ".join(cell_texts)
+                el["textPreview"] = el["text"][:60]
+            else:
+                el["kind"] = "graphic"
+            elements.append(el)
+            continue
         if tag == "pic":
             blip = sp.find(".//a:blip", NS)
             rid = blip.get(f"{{{NS['r']}}}embed")
@@ -266,6 +316,9 @@ def parse_slide(z, n, rels_map, slide_bg):
             registry.append(el)
         else:
             spPr = sp.find("p:spPr", NS)
+            far = cust_geom_fill_ratio(spPr)
+            if far is not None:
+                el["fill_area_ratio"] = far
             fill = solid_hex(spPr)
             if fill:
                 el["fillColor"] = f"#{fill.upper()}"
@@ -368,6 +421,36 @@ def parse_slide(z, n, rels_map, slide_bg):
             if bg != slide_bg:
                 el["fillColor"] = bg
                 el["fill_provenance"] = "effective_background_z_order_resolved_not_shape_fill"
+    # container-relation synthesis for thin decorations (anti-orphan): a thin
+    # non-text shape (band-diagram rule, caption divider, accent bar) that sits inside
+    # a filled panel is bound to that panel, so the RPA decorative_element_relations
+    # rule no longer flags it as ORPHAN_DECORATIVE_ELEMENT. Mirrors the rule's
+    # isThinDecoration (ratio>=18 && area<=2% of slide), plus the kind token check.
+    slide_area = 1280.0 * 720.0
+    for el in elements:
+        if el.get("kind") != "shape" or el.get("text") or el.get("relation"):
+            continue
+        bx = el["bbox"]
+        w, h = bx[2], bx[3]
+        if w <= 0 or h <= 0:
+            continue
+        ratio = max(w / h, h / w)
+        area_ratio = (w * h) / slide_area
+        if not (ratio >= 18.0 and area_ratio <= 0.02):
+            continue
+        cands = []
+        for u in elements:
+            if u is el or not u.get("fillColor"):
+                continue
+            far = u.get("fill_area_ratio")
+            if far is not None and far < 0.5:
+                continue  # border rule, not a real panel
+            ux, uy, uw, uh = u["bbox"]
+            if ux <= bx[0] and uy <= bx[1] and ux + uw >= bx[0] + w and uy + uh >= bx[1] + h:
+                cands.append(u)
+        if cands:
+            under = min(cands, key=lambda u: u["bbox"][2] * u["bbox"][3])
+            el["relation"] = {"type": "annotation", "target_id": under.get("aid")}
     return elements, registry
 
 
