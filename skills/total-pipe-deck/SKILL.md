@@ -9,9 +9,9 @@ agent_created: true
 三段流水线，各段是一个 MCP 连接器。**本文件就是调用契约，不要再去读连接器源码。**
 
 ```
-paperworkflow            pwf2rpa                  research_ppt
-PDF → 证据注册表    →    加 slide_briefs    →    选版面 / 规划 / 渲染
-workflow.json            rpa_input.json           deck plan
+paperworkflow          pwf2rpa            research_ppt          render (slidep)        pptx-telemetry
+PDF → 证据注册表  →  加 slide_briefs  →  选版面 / 规划    →    deck.pptx     →    OOXML 遥测 + QA
+workflow.json          rpa_input.json       deck_plan.json                                 sidecar / QA 报告
 ```
 
 | 段 | 连接器 | 位置 |
@@ -20,7 +20,10 @@ workflow.json            rpa_input.json           deck plan
 | 2 | `pwf2rpa` | `F:/Workbuddy/pwf2rpa` |
 | 3 | `research_ppt` | `C:/Users/Beibei/plugins/research-ppt-assistant`（symlink，真身 `F:/Project/PPTcreator/...`）|
 
-版本：RPA **0.6.0**，版面库 **2.0.0**（320 版面 / 40 分类），pwf2rpa **1.0.0**。
+版本：RPA **0.6.1**，版面库 **2.0.0**（320 版面 / 40 分类），pwf2rpa **1.0.0**。
+
+> RPA 必须用 **Node.js 24**（固定 `D:/Node24/node.exe`，v24.20.0 Krypton LTS）。
+> 不要硬编码 WorkBuddy managed node 的 `versions/<ver>/node.exe` 路径——升级会漂移。
 
 > 三个连接器都必须在连接器管理页点过 **Trust** 才有工具可用。如果某个工具
 > 不存在，先让用户去 Trust，不要去改代码。
@@ -191,7 +194,7 @@ MCP 工具只收内联 JSON，而真实论文的 `rpa_input.json` 常在 50–10
 
 ```bash
 cd C:/Users/Beibei/plugins/research-ppt-assistant
-NODE=C:/Users/Beibei/.workbuddy/binaries/node/versions/22.22.2/node.exe
+NODE=D:/Node24/node.exe
 $NODE server/cli.mjs normalize-content --file <rpa_input.json> --detail-level compact
 $NODE server/cli.mjs plan --file <rpa_input.json> \
       --presentation-type group_meeting --slide-count 6 --detail-level compact
@@ -215,7 +218,11 @@ $NODE server/cli.mjs plan --file <rpa_input.json> \
 
 ---
 
-## 阶段 4　渲染 pptx + RPA 后校验
+## 阶段 4　渲染 pptx + 交付物遥测校验（pptx-telemetry）
+
+> 下面裸 `node` 命令均指 `D:/Node24/node.exe`（RPA 必须 Node 24，见阶段 3 的
+> `NODE` 变量定义），在 RPA 目录 `C:/Users/Beibei/plugins/research-ppt-assistant`
+> 下执行。
 
 完整工作流写在 RPA 的 `docs/USAGE.zh-CN.md` **§3（92–108 行）**，CLI 用法在
 **§2（81–88 行）**，`preflight` 的输入结构在 §3 第 217 行起。
@@ -247,7 +254,39 @@ node server/cli.mjs preflight     --file preflight-input.json
 论文里的图从 `images/` 按 evidence 的 figure 引用带进去 —— 兜底生成的
 slide_briefs 不会自动带图，要进图必须自己指定。
 
-**4c. 渲染后校验**
+**4c. 渲染后 shape 级校验** —— 用 **pptx-telemetry** skill（同仓库
+`F:/Workbuddy/Total-pipe/skills/pptx-telemetry/`，符号链接在
+`C:/Users/Beibei/.workbuddy/skills/pptx-telemetry`，完整契约/阈值/排错都在它自己的
+SKILL.md 里）。
+
+slidep / tencent-pptx **不导出** Render Telemetry，所以不能直接喂
+`assemble-render-telemetry`（那需要渲染器给的 sidecar，现实中拿不到）。正确做法是
+从**交付 pptx 的 OOXML 自己解析**出 shape 级实测证据（像素 bbox / 字号 / 颜色 /
+溢出），再喂同一套 RPA QA 链：
+
+```bash
+PY=C:/Users/Beibei/.workbuddy/binaries/python/envs/default/Scripts/python.exe
+NODE=D:/Node24/node.exe
+TEL=F:/Workbuddy/Total-pipe/skills/pptx-telemetry/scripts
+
+# 1) OOXML -> sidecar（--plan 注入真实 layout_id/category，推荐；重跑前先清空 sidecars/）
+$PY $TEL/pptx_sidecars.py --pptx deck.pptx --out sidecars/ \
+    --deck-id my-deck --plan deck_plan.json
+
+# 2) 完整 QA 链：assemble → visual-quality 逐页 → 碰撞检测逐页 → validate-rendered-deck
+$PY $TEL/run_qa.py --sidecars sidecars/ --work qa/ --node $NODE --plan deck_plan.json
+```
+
+产物 `qa/summary.json`：顶层 `deck.collision_invalid_slides` /
+`deck.text_sparsity_invalid_slides` 等汇总，逐页 `collision_check` 与
+`visual_quality` 明细。
+
+关键阈值速查（改细节去 pptx-telemetry 的 SKILL.md，别在这里复制一份）：
+对比度 <4.5 报 `TEXT_CONTRAST_LOW`、密集图宽 ≳0.4、行高模型 1.2em、srcRect 裁剪要
+`preprocessed_fixed_region` 血缘、碰撞检测有含容过滤。缺 Pillow 会挂 sidecar 生成。
+
+**备选（极少用）**：只有渲染器确实导出了 `render-evidence-sidecar.json` 时才走
+RPA CLI 直连：
 
 ```bash
 node server/cli.mjs assemble-render-telemetry --file render-evidence-sidecar.json
@@ -255,9 +294,8 @@ node server/cli.mjs visual-quality            --file render-telemetry.json
 node server/cli.mjs validate-rendered-deck    --file rendered-deck.json
 ```
 
-**诚实原则**：像素级校验（visual-quality / validate-rendered-deck）需要渲染器给出
-shape 级遥测（像素 bbox、字号、颜色、文本溢出）。tencent-pptx 这次若没导出这些，
-**就明确报告「未做像素级校验」**——RPA 文档自己写了 `not_evaluable`
+**诚实原则**：像素级校验需要 shape 级遥测（像素 bbox、字号、颜色、文本溢出）。
+如果连 OOXML 解析都没做，**就明确报告「未做像素级校验」**——`not_evaluable`
 等于"补充真实遥测，不能视为通过"，绝不能当绿灯。
 
 ## 输出怎么读

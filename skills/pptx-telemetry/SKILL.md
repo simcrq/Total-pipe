@@ -24,7 +24,7 @@ slides/*.slide --slidep-start--> deck.pptx --pptx_sidecars.py--> sidecars/*.json
 | 依赖 | 用到什么 | 缺了会怎样 |
 |---|---|---|
 | Python 3 + **Pillow** | pptx_sidecars.py（真实字体度量用 msyh.ttc；派生图裁剪用 Image） | sidecar 生成挂 |
-| Node.js ≥18 | 跑 RPA CLI | QA 链挂 |
+| Node.js 24（固定 `D:/Node24/node.exe`） | 跑 RPA CLI | QA 链挂 |
 | research-ppt-assistant 插件 | `server/cli.mjs`（assemble/visual-quality/validate-rendered-deck） | QA 链挂 |
 
 不依赖 artifact-tool。路径可迁移：`run_qa.py --rpa-root`、`--node`。
@@ -33,7 +33,7 @@ slides/*.slide --slidep-start--> deck.pptx --pptx_sidecars.py--> sidecars/*.json
 
 ```bash
 PY=C:/Users/Beibei/.workbuddy/binaries/python/envs/default/Scripts/python.exe
-NODE=C:/Users/Beibei/.workbuddy/binaries/node/versions/22.22.2-2/node.exe
+NODE=D:/Node24/node.exe
 SKILL=C:/Users/Beibei/.workbuddy/skills/pptx-telemetry/scripts
 
 # 1) OOXML -> sidecar（--plan 注入真实 layout_id/category，可选但推荐）
