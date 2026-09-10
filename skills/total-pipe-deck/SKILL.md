@@ -50,7 +50,7 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/rpa_full_pipel
     --assets-from-slides        # 或 --assets-map 映射.json
 ```
 
-它按 S1→S7 串行，任一步 FAIL 立即中断（退出码 1），每步产物落在 `<out-dir>/_rpa/`，
+它按 S1→S8 串行，任一步 FAIL 立即中断（退出码 1），每步产物落在 `<out-dir>/_rpa/`，
 并生成 `_pipeline_report.md`。常用开关：
 
 | 参数 | 用途 |
@@ -60,12 +60,25 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/rpa_full_pipel
 | `--skeleton-out slides` | 默认 `slides_skeleton`（**不会覆盖正式页面**）；显式改 slides 才覆盖 |
 | `--skeleton-force` | 骨架目录已有 .slide 时强制覆盖 |
 | `--allow-visual-fail` | S5 几何不兼容仍继续（仅当手写 DSL 不按 RPA 槽位摆位时用） |
+| `--no-design` | 跳过 S8（不推荐；跳过就等于回到"空旷"的旧行为） |
+| `--min-font 10.5` | S8 字号下限，接管版面库的 18pt 约束 |
+| `--density 22 44` | S8 每页元素数软目标区间 |
 | `--strict` | warning 也当失败 |
 
-S1–S7 分别是：normalize-content → plan → validate-deck → preflight →
-visual-fit-preflight（每图）→ group-fit-preflight（多图页）→ deckplan2slide 骨架。
+S1–S8 分别是（**以 `rpa_full_pipeline.py` 的实现编号为准**，别按语感排）：
 
-**S5 失败时脚本会直接给替代版面**（按图槽几何算 contain 填充率排序），照着把该页
+| | 步骤 | 说明 |
+| :-- | :-- | :-- |
+| S1 | `normalize-content` | → `content_model.json` |
+| S2 | `plan` | → `deck_plan.json`，`pipeline_status` 必须 `plan_complete` |
+| S3 | `validate-deck` | 必须 `valid` |
+| S4 | `deckplan2slide.py` | 生成 SlideDSL 骨架（**必须先于 S5**，否则 preflight 报 `NO_PAGE_SOURCES`） |
+| S5 | `preflight` | `preflight_complete` 且 `status != invalid` |
+| S6 | `visual-fit-preflight` | 每张图不得 `fail` |
+| S7 | `group-fit-preflight` | 每页 ≥2 图时查分组几何 |
+| S8 | `design_land.py` | 出 `design_contract.json` + `_design_brief.md`。**只做准备，恒不 FAIL** |
+
+S5 失败时脚本会直接给替代版面（按图槽几何算 contain 填充率排序），照着把该页
 brief 的 `category_hint` 改掉再重跑即可，不用自己翻版面库。
 
 <details><summary>手工分步跑法（脚本出问题时才用）</summary>
@@ -133,6 +146,60 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/deckplan2slide
 
 改页数时先改 `briefs.json` 的条数再重跑 plan（`--slide-count` 是目标不是填充），
 然后删掉旧 slides/ 重新生成骨架。
+
+### S8 设计落地层（骨架 → 渲染之间的必经站）
+
+**为什么必须有**：版面库契约每页只给 4–8 个槽、正文下限 18pt（实测见下方表格），
+骨架忠实执行这份契约 → 每页 ~8 个大框、20pt 正文，**观感必然空旷**。
+S8 把字号管辖权从 `layouts.json` 接到自己的 `design_contract.json`，
+让 Agent 在已放行的槽位 bbox **内部**做排版细化与装饰落地。
+
+契约关系（别搞反）：
+
+| 契约 | 管辖范围 | 字号下限 |
+| :-- | :-- | :-- |
+| `layouts.json` | 版面选槽（S1–S7） | 18pt（实测 `{20:242, 18:78}`） |
+| `design_contract.json` | 槽位内部排版（S8+） | 10.5pt（可 `--min-font` 改） |
+
+两者不冲突：S5 preflight 已按 18pt 判过几何兼容并放行，S8 只在槽位内再切分，不再选槽。
+
+```bash
+DL="C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/design_land.py"
+
+python "$DL" contract --out design_contract.json --min-font 10.5 --density 22 44
+python "$DL" brief --skeleton slides/ --slots slides/_slots.md --out slides/_design_brief.md
+# —— 这里由 Agent 按任务书自由发挥，改写/扩写 slides/*.slide（构图不受脚本约束）——
+python "$DL" check --slides slides/ --contract design_contract.json --out _design_check.md
+```
+
+`rpa_full_pipeline.py` 的 S8 已把 contract + brief 一并跑掉，所以一键跑完就有任务书；
+**`check` 要等落地页写完再手动跑。**
+
+**关键：脚本不代写设计。** `brief` 只给三类东西——
+
+1. **事实**：每槽 bbox / 容量 / 已用字数 / 未覆盖的空白带 / 本页图片路径
+2. **软目标**：密度区间（默认 22–44 个元素/页）、字号阶梯、可按需覆盖
+3. **语汇货架**：顶栏标签 / 图注 / 脚注引文 / 指标双列 / 序号徽章 / 关键词高亮 /
+   来源标注 / 对比条 / 流程箭头 / 分隔留白 —— **是"货架"不是"清单"，可全不用，可自创**
+
+`check` 只卡 4 项**物理不可行**（画布越界 / 字号低于下限 / 文字溢出 / 页脚与页码），
+密度与构图只 WARN。`--strict` 才把 WARN 算失败。
+
+**版面库实测天花板**（`research-ppt-assistant/assets/layout-library/layouts.json` v2.0.0）：
+
+| 事实 | 值 |
+| :-- | :-- |
+| 每版面槽位数 | `{4:16, 5:112, 6:114, 7:68, 8:10}` → 单页最多 8 个元素 |
+| 1864 个槽的 `font_pt_hint` | 全为 `None`（不规定细粒度字号） |
+| `minimum_body_font_pt` | `{20:242, 18:78}` |
+| `default_body_font_pt` / `default_title_font_pt` | 20 / 30（全部 320 版面） |
+
+所以「空旷」不是 `deckplan2slide.py` 写错，是**整条快路径缺了 S8 这一站**。
+参考成品（Windows）色板 `1E4FA8/4A5568/1A2230/D6DCE5/F7F9FC` 恰等于该脚本的
+原始硬编码常量 → 它同样过了这座桥，只是桥后还跑了一次设计落地。**不是平台差异。**
+
+**验收提醒**：`element_area_ratio` 的 warning 阈值是 <0.35、fail 才 <0.18，
+**QA 全绿 ≠ 好看**。必须出图目视验收。
 
 ---
 
@@ -334,6 +401,19 @@ $NODE server/cli.mjs plan --file <rpa_input.json> \
 **§2（81–88 行）**，`preflight` 的输入结构在 §3 第 217 行起。
 **格式吃不准就去这两处查，不要猜参数、不要编字段名。**
 
+**4-1. 渲染前必须先过 S8 设计落地**
+
+骨架是「一槽一框」的几何产物，直接渲染必然空旷。渲染前按 S8 流程走一遍：
+
+```bash
+DL="C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/design_land.py"
+python "$DL" brief --skeleton slides/ --slots slides/_slots.md   # 出任务书
+#  ← 按任务书在全自由的前提下改写 slides/*.slide（详见阶段 3 的「S8 设计落地层」节）
+python "$DL" check --slides slides/ --contract design_contract.json
+```
+
+`check` 退出码非 0 就别往下渲染。
+
 **4a. 渲染前**
 
 ```bash
@@ -410,6 +490,8 @@ node server/cli.mjs validate-rendered-deck    --file rendered-deck.json
 |---|---|
 | `normalize_content` | `status`（应为 `valid`）、`violations`（应为 `[]`）、`source_count` / `citation_count` / `evidence_count` / `slide_brief_count` |
 | `create_deck_plan` / `cli plan` | 顶层 `pipeline_status`（应为 `plan_complete`）、`production_status`、`design_status`、`design_score`、`deck_title`、`theme_id`、`slide_count`；每页在 `slides[].index` / `slide_id` / `category` / `layout_id` / `visual_treatment` / `aesthetic_score` |
+| `design_land.py brief` | `_design_brief.md`：每页槽位 bbox / 容量 / 已用字数 / **未覆盖空白带** / 图片 / 语汇货架。**没有"必须画什么"** |
+| `design_land.py check` | 表头四列 `元素 / 最小字号 / 小字 / 越界 / 溢出`；`FAIL` 只有 4 种码：`FONT_TOO_SMALL` / `OUT_OF_CANVAS` / `TEXT_OVERFLOW` / 页脚页码缺失 |
 
 健康基线：`status=valid` + `violations=[]` + `pipeline_status=plan_complete`。
 不达标说明上游有问题，往回查，别在阶段 3 里硬调。
@@ -452,6 +534,14 @@ paperworkflow 同理，python 换成 `F:/Workbuddy/Total-pipe/paperworkflow/.ven
 | slidep validate 报 `CONTENT_OVERFLOW` | 常见触发：给徽章/胶囊里的 Text 加 `lineHeight: '<n>px'`（渲染器行高计算异常） | 去掉 px 行高，改在容器 Box 上定高居中；定位用**变量分离**（宽度改动 / 徽章改动分别单独 validate） |
 | slidep upsert-dsl 报 `10201 Export file is occupied` | pptx 正被编辑器/预览占用 | 先 upsert 到 `_v2.pptx` 副本，再用 `cp` 覆盖原文件（cp 能成功） |
 | 分隔线被判 `ORPHAN_DECORATIVE_ELEMENT` | 宽高比 ≥18 且面积占比 ≤0.02 的 decoration 元素 | 直接删掉分隔线、改用间距分组（加粗到 22px 才不算 thin，不划算） |
+| **成品"太空旷"**：文字飘在白底上，看不到卡片/竖条/装饰 | **根因是缺「设计落地层」，不是缺装饰。** 快路径 S4 出骨架 → 直接 `slidep start`，中间没有 S8 那一站。骨架忠实执行版面库契约（每页 4–8 槽、正文 18pt 下限）→ 必然空旷 | 补跑 S8：`design_land.py brief` 出任务书 → Agent 在槽位内做设计落地 → `check` 验收。详见「S8 设计落地层」节 |
+| pptx **只有形状、文字与图全空**（size ≈39KB、`ppt/slides/media` 为空、`<a:t>` 全空但 shapes 数正常） | `editor_sdk` 对**同一输出路径**反复 open/purge/commit 后会话变脏 | **换一个新的输出文件名**重渲即可（会话按 file_path 管理）。**不要 kill editor_sdk** |
+| `slidep stop` 报 `nothing to stop: pid file not found`，日志里多个 pid 交替 removeSlide/addSlide、页数翻倍 | `rm -rf <project>/.slidep` 把 pid 文件一起删了，旧 daemon 仍在跑 → 多 daemon 互殴 | 清理顺序必须**先 stop 再 rm**；已乱则 `pkill -f slidep` 后单实例重启 |
+| `slidep start` 报 `openFile network error: fetch failed` | `editor_sdk`（端口 39099，env `TENCENT_DOCS_LOCAL_MCP`）未运行。它是 WorkBuddy 宿主的本地编辑器服务，**没有自启命令** | 不要 kill 该进程；若已挂，等宿主自动拉起（实测约 30 分钟）后重试 |
+| 封面必然报 `EXCESSIVE_WHITESPACE`（element_area_ratio <0.18 fail / <0.35 warn） | 该指标**只统计文字/图片元素的 bbox，纯色卡片不计入**，且不区分 category | 封面按"主视觉式"版面意图放一条关键成果带（大数字 + 小标签三档），而非一行小字 |
+| 主题化后出现 `ELEMENT_COLLISION`（卡片互相遮挡） | 版面库存在**层叠式版面**（如 RM-GAP-04 的 gap/ours 与 contribution 上下叠 79px），实体卡会判碰撞 | 与其它槽重叠 >10% 的槽不加卡片底（`slice_flags()`），并把文字改顶部对齐，避免落进邻卡 |
+| JSX 报 `Unterminated regexp literal` | 文本里有**裸 `>`**（如"耐久 >60,000"） | 改写成"耐久超 60,000"等不含 `>` 的表述 |
+| slidep-export-images 报 504 / `upload credential failed` | 该命令依赖 docs.qq.com **在线**转换服务 | 非本地故障，稍后重试；验证结论以 QA 链为准，不要只靠导图 |
 
 pwf2rpa 的容量模拟保真度 70/72，漏报方向是安全的（RPA 自己还会再告警），
 所以**没警告不代表 RPA 一定完全满意**，但有了警告一定要先修。
@@ -519,3 +609,35 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_
 - **pwf2rpa**：默认兜底 briefs 常质量不佳（占位标题），人工重写后它就退化成**纯格式校验器**。重写 briefs 是合理的，但要清楚此时 `convert` 的自动映射价值≈0。
 - **research_ppt**：有 20 个 MCP 工具 + 20 个 CLI 命令，通常只用 `normalize-content` / `plan` / `validate-deck` 三个。版面库 320 个版面、以及 `preflight` / `figure-placement` / `group-fit-preflight` / `visual-fit-preflight` / `visual-quality` 这一串**渲染前预检**经常被跳过——而它们恰好是防碰撞的第一道闸。
 - **tencent-pptx**：组件有 14 个（box/text/image/**table**/chart/diagram/svg/faicon/math/codeblock/qrcode/hyperlink/animation/slide），实际常只用 4 个。表格类页面**务必用 `component-table.md` 的原生 Table**，不要用 Box+Text 手搭——手搭会被 QA 判 `EXCESSIVE_WHITESPACE`，且对齐难控。
+
+
+---
+
+### 「太空旷」专节：断点在哪、怎么修
+
+> 修法见上文「**S8 设计落地层**」节，这里只留断点定位的实测证据。
+
+**断点**：阶段 3 的 S4（`deckplan2slide.py` 骨架生成）**之后**、阶段 4 渲染**之前**——
+快路径缺 S8「设计落地层」。骨架是症状处不是根因；slidep 忠实渲染骨架，无责。
+
+**症状 vs 参考**（同论文、同 13 页、同管线）：
+
+| | 骨架（快路径） | 参考成品 |
+| :-- | :-- | :-- |
+| 元素/页 | ~8–12（13 页共 103 槽，见 `_slots.md`） | 28–49 shapes + 40–93 文本段 |
+| 最小字号 | 20pt 正文 / 16pt meta | 10.5pt 图注、12pt 脚注引文 |
+| 页脚 | 一整段 C 区 | 引文 + 分隔 + `Fig. 2e` 图注 |
+
+参考成品色板 `1E4FA8 / 4A5568 / 1A2230 / D6DCE5 / F7F9FC` 恰等于 `deckplan2slide.py`
+的**原始硬编码常量** → 它同样过了这座桥，只是**桥后还跑了一次设计落地**
+（tencent-pptx 完整流程的 `DESIGN.md` 层）。**这不是 Mac / Windows 平台差异。**
+
+**两条已排除的弯路**（别再走）：
+
+- **治标无效**——只给骨架加主题 token / 6px 语义竖条 / 白卡圆角。装饰贴在 8 个大框上
+  仍然空，密度问题一点没动。
+- **绕过管线**——用 `ooxml2slide.py` 把一份达标成品转回 `.slide` 当模板。观感能一致，
+  但这是拿成品反推，不补管线能力缺口，换个新论文立刻失效。
+
+**验收提醒**：`element_area_ratio` 的 warning 阈值是 <0.35、fail 才 <0.18，
+**QA 全绿 ≠ 好看**。封面 18.6% 只有 warning，照样放行。必须出图目视验收。

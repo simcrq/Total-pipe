@@ -32,11 +32,34 @@ PX_PER_IN = 96.0          # 13.333in -> 1280px
 PT_TO_PX = 96.0 / 72.0    # 1pt = 1.333px
 
 FONT = "Microsoft YaHei"
-C_BG = "#FFFFFF"
-C_TITLE = "#1E4FA8"
-C_TEXT = "#1A2230"
-C_MUTED = "#4A5568"
-C_LINE = "#D6DCE5"
+
+# 主题 token（从 <rpa-root>/assets/layout-library/themes.json 读取，失败回退）
+THEME = {
+    "bg": "#F8FAFC", "panel": "#FFFFFF", "text": "#0F172A",
+    "muted": "#64748B", "accent1": "#2563EB", "accent2": "#0EA5E9",
+    "accent3": "#14B8A6", "border": "#CBD5E1",
+}
+
+
+def load_theme(rpa_root, theme_id):
+    global THEME
+    p = os.path.join(rpa_root, "assets", "layout-library", "themes.json")
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+        for t in d.get("themes", []):
+            if t.get("id") == theme_id:
+                THEME = {k: t[k] for k in
+                         ("bg", "panel", "text", "muted", "accent1",
+                          "accent2", "accent3", "border")}
+                return
+        print("  [warn] themes.json 无 %s，用默认 paper_blue token" % theme_id)
+    except Exception as e:
+        print("  [warn] 读 themes.json 失败(%s)，用默认 token" % e)
+
+
+# 8 位 hex：accent1 淡底（约 10% 不透明度），用于强调条/淡底卡片
+def _fade(hex6, alpha="1A"):
+    return (hex6 + alpha) if hex6.startswith("#") and len(hex6) == 7 else hex6
 
 IMAGE_TYPES = {"image", "figure", "visual", "photo", "chart", "diagram"}
 TABLE_TYPES = {"table", "matrix", "grid"}
@@ -50,24 +73,41 @@ TPL_HEAD = """<Slide style={{ width: '1280px', height: '720px', background: '%(b
   {/* evidence_ids: %(evs)s */}
 """
 
+# 标题：accent 竖条 + 文字（pos_bar/pos_txt 由 render_slot 预计算）
+TPL_TITLE = """  {/* [%(sid)s] %(label)s%(cap)s · %(fs)dpx */}
+  <Box style={{ %(pos_bar)s, background: '%(accent1)s' }} />
+  <Box style={{ %(pos_txt)s, flexDirection: 'column', justifyContent: 'center' }}>
+    <Text style={{ fontSize: %(fs)d, color: '%(text)s', fontFamily: '%(font)s', fontWeight: 'bold' }}>
+      TODO: %(label)s
+    </Text>
+  </Box>
+"""
+
+# 正文槽：语义色竖条（版面库 SVG 的视觉语言）+ 可选卡片底（%(card)s；重叠槽留空避免遮挡）
 TPL_TEXT = """  {/* [%(sid)s] %(label)s%(cap)s · %(fs)dpx */}
-  <Box style={{ %(pos)s, flexDirection: 'column', justifyContent: 'center' }}>
+  <Box style={{ %(pos_bar)s, background: '%(bar_c)s' }} />
+  <Box style={{ %(pos)s%(card)s, flexDirection: 'column', justifyContent: %(jc)s, paddingTop: %(pt)d, paddingLeft: 24, paddingRight: 24 }}>
     <Text style={{ fontSize: %(fs)d, color: '%(color)s', fontFamily: '%(font)s', fontWeight: '%(weight)s' }}>
       TODO: %(label)s
     </Text>
   </Box>
 """
 
+# 图片槽：可选卡片底
 TPL_IMAGE = """  {/* [%(sid)s] %(label)s%(cap)s */}
-  <Image src="assets/TODO.png" style={{ %(pos)s, objectFit: 'contain' }} />
+  <Box style={{ %(pos_bar)s, background: '%(bar_c)s' }} />
+  <Box style={{ %(pos)s%(card)s }}>
+    <Image src="assets/TODO.png" style={{ width: '100%%', height: '100%%', objectFit: 'contain' }} />
+  </Box>
 """
 
 TPL_TABLE = """  {/* [%(sid)s] %(label)s%(cap)s */}
-  <Box style={{ %(pos)s }}>
+  <Box style={{ %(pos_bar)s, background: '%(bar_c)s' }} />
+  <Box style={{ %(pos)s%(card)s, padding: 6 }}>
     <Table
       style={{ width: '100%%', height: '100%%' }}
       defaultTextStyle={{ fontSize: 14, color: '%(text)s', fontFamily: '%(font)s', textAlign: 'left' }}
-      defaultCellStyle={{ padding: 12, border: { left: { width: 1, color: '%(line)s' }, right: { width: 1, color: '%(line)s' }, top: { width: 1, color: '%(line)s' }, bottom: { width: 1, color: '%(line)s' } } }}
+      defaultCellStyle={{ padding: 12, border: { left: { width: 1, color: '%(border)s' }, right: { width: 1, color: '%(border)s' }, top: { width: 1, color: '%(border)s' }, bottom: { width: 1, color: '%(border)s' } } }}
       cells={ [ ['列1', '列2'], ['TODO', 'TODO'] ] }
     />
   </Box>
@@ -75,9 +115,9 @@ TPL_TABLE = """  {/* [%(sid)s] %(label)s%(cap)s */}
 
 TPL_FOOT = """  {/* C 页脚区 660-720（母版三区硬约束） */}
   <Box style={{ position: 'absolute', top: 660, left: 40, right: 40, height: 60, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-    <Box style={{ width: '100%%', height: 1, background: '%(line)s', position: 'absolute', top: 0, left: 0, right: 0 }} />
+    <Box style={{ width: '100%%', height: 1, background: '%(border)s', position: 'absolute', top: 0, left: 0, right: 0 }} />
     <Text style={{ fontSize: 14, color: '%(muted)s', fontFamily: '%(font)s', marginTop: 14 }}>%(title)s</Text>
-    <Text style={{ fontSize: 16, color: '%(title_c)s', fontFamily: '%(font)s', fontWeight: 'bold', marginTop: 14 }}>%(nn)02d / %(total)d</Text>
+    <Text style={{ fontSize: 16, color: '%(accent1)s', fontFamily: '%(font)s', fontWeight: 'bold', marginTop: 14 }}>%(nn)02d / %(total)d</Text>
   </Box>
 </Slide>
 """
@@ -115,38 +155,116 @@ def font_px(capacity):
     return int(round((capacity or {}).get("font_pt_hint", 20) * PT_TO_PX))
 
 
-def render_slot(slot):
+# 语义竖条配色：问题/缺口类用 accent2，其余用 muted（对齐版面库 SVG 的槽位配色语言）
+BAR_WARM = ("gap", "problem", "limitation", "limit", "challenge", "risk", "question")
+
+
+def bar_color(sid, stype):
+    s = (sid or "").lower()
+    t = (stype or "").lower()
+    if any(k in s for k in BAR_WARM) or any(k in t for k in BAR_WARM):
+        return THEME["accent2"]
+    return THEME["muted"]
+
+
+def slice_flags(specs):
+    """标记与其它槽位几何重叠的槽（重叠面积占自身 >10%）。
+
+    版面库里存在层叠式版面（如 RM-GAP-04 的 gap/ours 与 contribution 上下叠放）。
+    这类槽不给卡片底，避免实体遮挡与 ELEMENT_COLLISION；竖条仍保留，视觉不塌。
+    """
+    boxes = [(s.get("pptx_in") or s.get("box") or
+              {"x": 0, "y": 0, "w": 0, "h": 0}) for s in specs]
+    flags = []
+    for i, a in enumerate(boxes):
+        hit = False
+        for j, b in enumerate(boxes):
+            if i == j:
+                continue
+            ox = max(0.0, min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"]))
+            oy = max(0.0, min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"]))
+            area = a["w"] * a["h"] or 1.0
+            if (ox * oy) / area > 0.10:
+                hit = True
+                break
+        flags.append(hit)
+    return flags
+
+
+def render_slot(slot, overlap=False):
     sid = slot.get("slot_id", "slot")
     stype = (slot.get("slot_type") or "text").lower()
     cap = slot.get("capacity") or {}
     fs = font_px(cap)
     maxchars = cap.get("max_chars")
+    box = slot.get("pptx_in") or slot.get("box") or {"x": 0, "y": 0, "w": 1, "h": 1}
+    t, l = round(box["y"] * PX_PER_IN), round(box["x"] * PX_PER_IN)
+    h, w = round(box["h"] * PX_PER_IN), round(box["w"] * PX_PER_IN)
+    card = ("" if overlap else
+            ", background: '%s', borderRadius: 12, border: '1px solid %s'"
+            % (THEME["panel"], THEME["border"]))
     ctx = {
         "sid": sid,
         "label": slot.get("label_zh") or sid,
         "cap": (" · ≤%d字" % maxchars) if maxchars else "",
         "fs": fs,
-        "pos": to_px(slot.get("pptx_in") or slot.get("box")),
-        "font": FONT, "text": C_TEXT, "line": C_LINE, "muted": C_MUTED,
-        "title_c": C_TITLE, "color": C_TEXT, "weight": "normal",
+        "pos": to_px(box),
+        "pos_bar": ("position: 'absolute', top: %d, left: %d, width: 6, height: %d"
+                    % (t + (26 if overlap else max(0, (h - 52) // 2)), l, min(52, h))),
+        "jc": ("'flex-start'" if overlap else "'center'"),
+        "pt": (20 if overlap else 0),
+        "bar_c": bar_color(sid, stype),
+        "card": card,
+        "font": FONT, "text": THEME["text"], "muted": THEME["muted"],
+        "border": THEME["border"], "panel": THEME["panel"],
+        "accent1": THEME["accent1"], "fade": _fade(THEME["accent1"]),
+        "color": THEME["text"], "weight": "normal",
     }
     if stype in TABLE_TYPES:
         return TPL_TABLE % ctx
     if stype in IMAGE_TYPES:
         return TPL_IMAGE % ctx
-    if sid.lower() in TITLE_IDS or stype == "title":
-        ctx["color"] = C_TITLE
+    if sid.lower() in ("title", "headline") or stype == "title":
+        # 标题：加长竖条（52px）+ 文字右移 22px
+        ctx["pos_bar"] = ("position: 'absolute', top: %d, left: %d, width: 6, height: %d"
+                          % (t + max(0, (h - 52) // 2), l, min(52, h)))
+        ctx["pos_txt"] = ("position: 'absolute', top: %d, left: %d, width: %d, height: %d"
+                          % (t, l + 22, w - 22, h))
+        return TPL_TITLE % ctx
+    if sid.lower() in ("kicker", "subtitle"):
+        # 副标题：accent 色粗体，无卡片底（避免封面层叠碰撞）
+        ctx["color"] = THEME["accent1"]
         ctx["weight"] = "bold"
-    elif stype in ("takeaway", "headline"):
+        ctx["card"] = ""
+        return TPL_TEXT % ctx
+    if stype in ("takeaway", "headline", "insight", "conclusion"):
+        # 强调槽：accent 淡底（重叠时同样留空）
+        if not overlap:
+            ctx["card"] = (", background: '%s', borderRadius: 12" % _fade(THEME["accent1"]))
         ctx["weight"] = "bold"
     return TPL_TEXT % ctx
+
+
+def page_slug(slide):
+    """页面文件名的语义后缀。
+
+    preflight 会判 NON_CANONICAL_PAGE_NAME：只有两位序号（01.slide）不算规范名，
+    页序稳定性依赖语义后缀。分类名最稳，退化时用 title 的 ASCII 部分。
+    """
+    import re as _re
+    cat = (slide.get("category") or "").strip().lower()
+    cat = _re.sub(r"[^a-z0-9]+", "_", cat).strip("_")
+    if cat:
+        return cat
+    t = _re.sub(r"[^A-Za-z0-9]+", "_", slide.get("title") or "").strip("_").lower()
+    return t or "page"
 
 
 def build_slide(slide, layout, total, theme):
     n = slide.get("index")
     title = (slide.get("title") or "").replace("{", "").replace("}", "")
     head = TPL_HEAD % {
-        "bg": C_BG, "lid": slide.get("layout_id"), "cat": slide.get("category"),
+        "bg": THEME["bg"], "lid": slide.get("layout_id"), "cat": slide.get("category"),
         "theme": theme, "title": title,
         "evs": ", ".join(slide.get("evidence_ids") or []),
     }
@@ -159,13 +277,15 @@ def build_slide(slide, layout, total, theme):
         by_id = {s.get("slot_id"): s for s in specs}
         ordered = [by_id[k] for k in order if k in by_id]
         ordered += [s for s in specs if s.get("slot_id") not in order]
-        for s in ordered:
-            if s.get("collapse_when_empty") and not s.get("required"):
-                continue
-            body.append(render_slot(s))
+        ordered = [s for s in ordered
+                   if not (s.get("collapse_when_empty") and not s.get("required"))]
+        flags = slice_flags(ordered)
+        for s, ov in zip(ordered, flags):
+            body.append(render_slot(s, overlap=ov))
             body.append("\n")
     foot = TPL_FOOT % {
-        "line": C_LINE, "muted": C_MUTED, "font": FONT, "title_c": C_TITLE,
+        "border": THEME["border"], "muted": THEME["muted"], "font": FONT,
+        "accent1": THEME["accent1"],
         "title": title, "nn": n, "total": total,
     }
     return head + "\n" + "".join(body) + foot
@@ -180,6 +300,8 @@ def main():
     ap.add_argument("--node", default="node")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
+
+    load_theme(args.rpa_root, args.theme)  # 主题 token 前置加载
 
     # ---- 前置门禁：没有合格的 plan 就不许生成 ----
     if not os.path.exists(args.plan):
@@ -212,7 +334,8 @@ def main():
         lid = s.get("layout_id")
         d = run_get_layout(args.rpa_root, args.node, lid, args.theme, cache_dir)
         layout = (d or {}).get("layout") if d else None
-        open(os.path.join(args.out, "%02d.slide" % s["index"]), "w",
+        fname = "%02d_%s.slide" % (s["index"], page_slug(s))
+        open(os.path.join(args.out, fname), "w",
              encoding="utf-8").write(build_slide(s, layout, total, args.theme))
 
         rows = []
@@ -226,7 +349,7 @@ def main():
         manifest.append("| slot | type | max_chars | max_lines | font | 说明 |\n"
                         "| :-- | :-- | :-- | :-- | :-- | :-- |\n")
         manifest.append(("\n".join(rows) + "\n") if rows else "(无 slot 信息)\n")
-        print("  P%02d %s -> %02d.slide (%d slots)" % (s["index"], lid, s["index"], len(rows)))
+        print("  P%02d %s -> %s (%d slots)" % (s["index"], lid, fname, len(rows)))
 
     open(os.path.join(args.out, "_slots.md"), "w", encoding="utf-8").write("\n".join(manifest))
     print("\n生成 %d 页骨架 -> %s/" % (total, args.out))

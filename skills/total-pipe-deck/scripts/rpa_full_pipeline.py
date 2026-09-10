@@ -15,10 +15,29 @@ Agent 得先猜；猜不中就绕过。
     S1  normalize-content     → status 必须 valid
     S2  plan                  → pipeline_status 必须 plan_complete
     S3  validate-deck         → status 必须 valid
-    S4  preflight             → preflight_complete 且 status != invalid
-    S5  visual-fit-preflight  → 每张图 status 不得 fail
-    S6  group-fit-preflight   → 每页 ≥2 图时检查分组几何
-    S7  deckplan2slide.py     → 生成 SlideDSL 骨架（可选，默认开）
+    S4  deckplan2slide.py     → 生成 SlideDSL 骨架（可选，默认开）
+    S5  preflight             → preflight_complete 且 status != invalid
+    S6  visual-fit-preflight  → 每张图 status 不得 fail
+    S7  group-fit-preflight   → 每页 ≥2 图时检查分组几何
+    S8  design_land.py        → 出 design_contract.json + 设计任务书（只做准备，恒不 FAIL）
+
+S8 为什么必须有
+---------------
+版面库契约每页只给 4–8 个槽、正文下限 18pt（实测 layouts.json v2.0.0），骨架忠实执行
+这份契约 → 每页 ~8 个大框，观感必然空旷。S8 是「阶段 3 之后、渲染之前」的设计落地层：
+它把字号管辖权从 layouts.json 接过来（design_contract.json，默认下限 10.5pt），
+并产出一份设计任务书供 Agent 在槽位内部做排版细化。
+注意：S8 只做准备，**构图交给人/Agent**，脚本不代写设计。
+
+顺序说明
+--------
+S5 preflight 会真实查磁盘上的 source_files，所以**必须**先跑 S4 生成骨架，
+否则一定报 NO_PAGE_SOURCES（空 slides 目录）。0.3.x 之后 preflight 不再是纯
+声明校验，把它排在骨架之后才有意义。
+
+另外 platform 默认跟随宿主机（win32/darwin/linux）。写死 win32 在非 Windows 机器上
+必然报 PROJECT_PATH_NOT_DRIVE_ABSOLUTE 并连带触发 FILESYSTEM_VERIFY_SKIPPED
+（"无法验证文件是否存在"），把可验证的校验降级成瞎猜。
 
 任一步 FAIL → 立即退出，退出码 1，并打印「怎么修」。
 
@@ -56,6 +75,8 @@ PX_PER_INCH = 96.0
 
 DEFAULT_RPA_ROOT = r"C:/Users/Beibei/plugins/research-ppt-assistant"
 DEFAULT_NODE = r"D:/Node24/node.exe"
+DEFAULT_PLATFORM = "darwin" if sys.platform == "darwin" else (
+    "win32" if os.name == "nt" else "linux")
 
 
 # ---------------------------------------------------------------------------- 工具
@@ -250,6 +271,9 @@ def main():
     ap.add_argument("--project", default="", help="PPT 项目目录（preflight + 骨架输出）")
     ap.add_argument("--rpa-root", default=DEFAULT_RPA_ROOT)
     ap.add_argument("--node", default=DEFAULT_NODE)
+    ap.add_argument("--platform", default=DEFAULT_PLATFORM,
+                    help="preflight 的 renderer_inputs.platform，默认跟随宿主机"
+                         "（写死 win32 在非 Windows 机器上会报 PROJECT_PATH_NOT_DRIVE_ABSOLUTE）")
     ap.add_argument("--theme", default="paper_blue")
     ap.add_argument("--presentation-type", default="group_meeting")
     ap.add_argument("--slide-count", type=int, default=0, help="目标页数提示（实际由 briefs 数决定）")
@@ -257,7 +281,13 @@ def main():
     ap.add_argument("--assets-map", default="", help='{"4":["assets/fig1.png"]} 形式的 JSON')
     ap.add_argument("--assets-from-slides", action="store_true",
                     help="从 <project>/slides/NN.slide 里 grep 图片引用")
-    ap.add_argument("--no-skeleton", action="store_true", help="跳过 S7 骨架生成")
+    ap.add_argument("--no-skeleton", action="store_true", help="跳过 S4 骨架生成")
+    ap.add_argument("--no-design", action="store_true",
+                    help="跳过 S8 设计落地准备（契约 + 设计任务书）")
+    ap.add_argument("--min-font", type=float, default=10.5,
+                    help="S8 的字号下限（接管 layouts.json 的 18pt 约束）")
+    ap.add_argument("--density", nargs=2, type=int, default=[22, 44],
+                    metavar=("LO", "HI"), help="S8 每页元素数软目标区间")
     # 注意：默认输出到 slides_skeleton 而不是 slides，避免一键跑覆盖已完成的页面。
     ap.add_argument("--skeleton-out", default="slides_skeleton",
                     help="骨架输出子目录名（默认 slides_skeleton；"
@@ -367,17 +397,45 @@ def main():
         print("\n怎么修：见 %s 的 results[].issues" % os.path.join(work, "validate_deck.json"))
         return finish(work, steps, failed, warned, args)
 
-    # ---------------------------------------------------------------- S4
+    # ---------------------------------------------------------------- S4 骨架
+    # preflight 会真实查磁盘上的 source_files，所以骨架必须先于它生成。
+    skel_dir = ""
+    if args.no_skeleton:
+        record("S4", "deckplan2slide 骨架", "SKIP", "--no-skeleton")
+    elif not args.project:
+        record("S4", "deckplan2slide 骨架", "SKIP", "未给 --project")
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        gen = os.path.join(here, "deckplan2slide.py")
+        if not os.path.isfile(gen):
+            record("S4", "deckplan2slide 骨架", "SKIP", "找不到 " + gen)
+        else:
+            skel_dir = os.path.join(args.project, args.skeleton_out)
+            cmd = [sys.executable, gen, "--plan", plan_path,
+                   "--rpa-root", args.rpa_root, "--out", skel_dir,
+                   "--node", args.node]
+            if args.skeleton_force:
+                cmd.append("--force")
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            if r.returncode == 0:
+                record("S4", "deckplan2slide 骨架", "PASS", "输出 → " + skel_dir)
+            else:
+                record("S4", "deckplan2slide 骨架", "FAIL",
+                       (r.stdout or r.stderr or "")[-300:].replace("\n", " "))
+                return finish(work, steps, failed, warned, args)
+
+    # ---------------------------------------------------------------- S5
     src_files = []
-    if args.project:
-        sd = os.path.join(args.project, "slides")
-        if os.path.isdir(sd):
-            src_files = sorted("slides/" + f for f in os.listdir(sd) if f.endswith(".slide"))
+    if args.project and skel_dir and os.path.isdir(skel_dir):
+        rel = os.path.relpath(skel_dir, args.project).replace(os.sep, "/")
+        src_files = sorted(rel + "/" + f for f in os.listdir(skel_dir)
+                           if f.endswith(".slide"))
     pf_in = {
         "renderer_inputs": {
             "requested_renderer": "slidep",
             "renderer_version": "5.4.4",
-            "platform": "win32",
+            "platform": args.platform,
             "project_path": (args.project or "").replace("\\", "/"),
             "project_exists": bool(args.project) and os.path.isdir(args.project),
             "source_files": src_files,
@@ -399,12 +457,15 @@ def main():
         codes = sorted({i.get("code") for i in pissues if i.get("code")})
         if codes:
             note += " · issues=%s" % ",".join(codes)
-        record("S4", "preflight", "WARN" if pstat == "warning" else "PASS", note)
+        record("S5", "preflight", "WARN" if pstat == "warning" else "PASS", note)
         for i in pissues:
             if i.get("code") == "NON_CANONICAL_PAGE_NAME":
                 print("        └ 页码文件缺语义后缀，建议改成 01_cover.slide / 02_method.slide 这种。")
+            if i.get("code") == "NO_PAGE_SOURCES":
+                print("        └ source_files 为空：先跑骨架生成（去掉 --no-skeleton，"
+                      "或 --skeleton-out 指到已有 .slide 的目录）。")
     else:
-        record("S4", "preflight", "FAIL", "%s · status=%s" % (pps, pstat))
+        record("S5", "preflight", "FAIL", "%s · status=%s" % (pps, pstat))
         print("\n怎么修：检查重复 pageId、.jsx 页面源、无效 Windows 路径、Slot Contract 错误。")
         return finish(work, steps, failed, warned, args)
 
@@ -511,7 +572,7 @@ def main():
                 vfit_warn.append((page, slot["slot_id"], r.get("reason") or ""))
 
     if vfit_fail:
-        record("S5", "visual-fit-preflight", "FAIL",
+        record("S6", "visual-fit-preflight", "FAIL",
                "%s 张图几何不兼容" % len(vfit_fail))
         for f in vfit_fail:
             print("        x P%02d %-8s %s  [%s]" % (f["page"], f["slot"], f["why"], f["asset"]))
@@ -530,12 +591,12 @@ def main():
         print("        （--allow-visual-fail 已开，继续后续步骤）")
     if vfit_rows:
         st5 = "WARN" if vfit_warn else "PASS"
-        record("S5", "visual-fit-preflight", st5,
+        record("S6", "visual-fit-preflight", st5,
                "检查 %s 张图 · %s warning" % (len(vfit_rows), len(vfit_warn)))
         for pg, sl, why in vfit_warn[:5]:
             print("        ! P%02d %s : %s" % (pg, sl, why))
     else:
-        record("S5", "visual-fit-preflight", "SKIP", "没有可检查的图（无映射或版面无图槽）")
+        record("S6", "visual-fit-preflight", "SKIP", "没有可检查的图（无映射或版面无图槽）")
     if vfit_skip_pages:
         print("        ! 未覆盖 %s 页：%s" % (len(vfit_skip_pages), vfit_skip_pages[:4]))
 
@@ -545,7 +606,7 @@ def main():
         multi.setdefault(row["page"], []).append(row)
     groups = {p: rows for p, rows in multi.items() if len(rows) >= 2}
     if not groups:
-        record("S6", "group-fit-preflight", "SKIP", "没有多图同页（<2 图/页）")
+        record("S7", "group-fit-preflight", "SKIP", "没有多图同页（<2 图/页）")
     else:
         gdir = os.path.join(work, "group_fit")
         gres = []
@@ -601,42 +662,57 @@ def main():
                 gres.append((page, "error", "", str(e)[:120]))
         gbad = [g for g in gres if g[1] == "fail"]
         if gbad:
-            record("S6", "group-fit-preflight", "FAIL",
+            record("S7", "group-fit-preflight", "FAIL",
                    "%s 页分组几何冲突" % len(gbad))
             for pg, stt, dec, why in gbad:
                 print("        x P%02d %s %s" % (pg, dec, why))
             return finish(work, steps, failed, warned, args)
-        record("S6", "group-fit-preflight", "PASS",
+        record("S7", "group-fit-preflight", "PASS",
                "检查 %s 个多图页" % len(gres))
         for pg, stt, dec, why in gres:
             print("        · P%02d %s %s" % (pg, stt, dec))
 
-    # ---------------------------------------------------------------- S7
-    if args.no_skeleton:
-        record("S7", "deckplan2slide 骨架", "SKIP", "--no-skeleton")
+    # ---------------------------------------------------------------- S8
+    # 设计落地准备：把字号管辖权从 layouts.json(18pt) 接到 design_contract.json(10.5pt)，
+    # 并产出设计任务书。只做准备，**不代写构图**；失败降级为 WARN 而不是 FAIL。
+    if args.no_design:
+        record("S8", "设计落地准备", "SKIP", "--no-design")
+    elif not skel_dir or not os.path.isdir(skel_dir):
+        record("S8", "设计落地准备", "SKIP", "没有骨架目录可落地")
     else:
-        if not args.project:
-            record("S7", "deckplan2slide 骨架", "SKIP", "未给 --project")
+        here = os.path.dirname(os.path.abspath(__file__))
+        dl = os.path.join(here, "design_land.py")
+        if not os.path.isfile(dl):
+            record("S8", "设计落地准备", "SKIP", "找不到 " + dl)
         else:
-            here = os.path.dirname(os.path.abspath(__file__))
-            gen = os.path.join(here, "deckplan2slide.py")
-            if not os.path.isfile(gen):
-                record("S7", "deckplan2slide 骨架", "SKIP", "找不到 " + gen)
+            dlo, dhi = args.density
+            contract_path = os.path.join(args.out_dir, "design_contract.json")
+            subprocess.run(
+                [sys.executable, dl, "contract", "--out", contract_path,
+                 "--min-font", str(args.min_font),
+                 "--density", str(dlo), str(dhi)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            brief_out = os.path.join(skel_dir, "_design_brief.md")
+            cmd = [sys.executable, dl, "brief", "--skeleton", skel_dir,
+                   "--out", brief_out, "--min-font", str(args.min_font),
+                   "--density", str(dlo), str(dhi)]
+            slots_md = os.path.join(skel_dir, "_slots.md")
+            if os.path.isfile(slots_md):
+                cmd += ["--slots", slots_md]
+            cb = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
+            if cb.returncode == 0:
+                record("S8", "设计落地准备", "PASS",
+                       "字号下限 %.1fpt · 密度目标 %d-%d · 任务书已出" % (
+                           args.min_font, dlo, dhi))
+                print("        · 契约   → %s" % contract_path)
+                print("        · 任务书 → %s" % brief_out)
+                print("        · 下一步：按任务书在槽位内部做设计落地，然后")
+                print("          python %s check --slides <落地页目录> --contract %s"
+                      % (os.path.join(here, "design_land.py"), contract_path))
             else:
-                out_dir = os.path.join(args.project, args.skeleton_out)
-                cmd = [sys.executable, gen, "--plan", plan_path,
-                       "--rpa-root", args.rpa_root, "--out", out_dir,
-                       "--node", args.node]
-                if args.skeleton_force:
-                    cmd.append("--force")
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace")
-                if r.returncode == 0:
-                    record("S7", "deckplan2slide 骨架", "PASS", "输出 → " + out_dir)
-                else:
-                    record("S7", "deckplan2slide 骨架", "FAIL",
-                           (r.stdout or r.stderr or "")[-300:].replace("\n", " "))
-                    return finish(work, steps, failed, warned, args)
+                record("S8", "设计落地准备", "WARN",
+                       (cb.stdout or cb.stderr or "")[-200:].replace("\n", " "))
 
     return finish(work, steps, failed, warned, args)
 
