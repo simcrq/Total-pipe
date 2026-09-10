@@ -36,10 +36,22 @@ design_land.py — S8「设计落地层」：阶段 3 之后、阶段 4 渲染�
 子命令
 ------
     design_land.py contract --out design_contract.json [--min-font 10.5]
-    design_land.py brief  --skeleton <骨架目录> --slots <_slots.md> [--content x.md]
-    design_land.py check  --slides <落地页目录> [--contract design_contract.json]
+    design_land.py brief  --skeleton <骨架目录> --slots <_slots.md> [--content x.md] [--assets <资产目录>...]
+    design_land.py check  --slides <落地页目录> [--contract design_contract.json] [--assets <资产目录>...]
 
 退出码：brief/contract 恒 0；check 有 FAIL → 1（--strict 时 WARN 也算 FAIL）。
+
+图片硬约束（v1.1.0 起）
+-----------------------
+渲染器（slidep）对图片**一律按 cover 裁切到图框比例**，`objectFit` 属性无效——
+实测 contain/cover/fill、写在 prop 还是 style，产出逐字节相同。
+因此「图片图框的宽高比」是唯一能控制裁切的量：
+
+    图框比例 != 图片比例  →  按较小的一维铺满，另一维被裁掉
+
+契约要求先按图片自身比例算适配矩形，再让图框**等于**该矩形。
+brief 会为每张图列出原始尺寸与建议图框；check 对比例不符的图判 FAIL
+（IMAGE_ASPECT_MISMATCH）。
 """
 
 from __future__ import annotations
@@ -54,7 +66,7 @@ CANVAS_W, CANVAS_H = 1280, 720
 FOOTER_TOP = 660
 
 DEFAULT_CONTRACT = {
-    "design_layer_version": "1.0.0",
+    "design_layer_version": "1.1.0",
     "authority": "S8 之后字号由本契约管辖，不再受 layouts.json minimum_body_font_pt(18) 约束",
     "canvas": {"width": CANVAS_W, "height": CANVAS_H},
     "footer_top_px": FOOTER_TOP,
@@ -68,6 +80,14 @@ DEFAULT_CONTRACT = {
     },
     "density_target_shapes_per_page": [22, 44],
     "line_height_ratio": 1.45,
+    # 图片图框的宽高比必须等于图片文件自身的宽高比（相对偏差容差）。
+    # 这不是审美要求：渲染器对图片一律按 cover 裁切到图框比例，
+    # 图框比例不匹配 = 画面内容被裁掉。见文件中部「图片」一节。
+    "image_frame_aspect_tolerance": 0.02,
+    "image_fit_mode": (
+        "contain —— 先按图片自身比例算出适配矩形，再让图框等于该矩形；"
+        "不要先定图框再让图片去适应它（会被 cover 裁切）"
+    ),
 }
 
 # 语汇菜单：只是「货架」，不是清单。AI 可以全不用，也可以自己发明。
@@ -235,6 +255,129 @@ def est_text_height(text: str, fs: float, avail_w: float, ratio: float) -> float
 
 
 # --------------------------------------------------------------------------- #
+# 图片：读真实像素尺寸 + 算「不变形不裁切」的图框
+# --------------------------------------------------------------------------- #
+# 为什么必须有这一节
+# ------------------
+# slidep 的 pptx 写出端对每一张图片**无条件按 cover 裁切到图框比例**：
+#   - `objectFit` 写成 prop 也好、写在 style 里也好，填 contain / cover / fill
+#     —— 产出**逐字节相同**，属性完全无效；
+#   - 唯一影响裁切量的是**图框自身的宽高比**。
+# 实测（frame 1107x318 放进 440x209 的图）：
+#   srcRect t=19761 b=19761  → 上下各裁 19.76%，恰好 = 1 - (图 AR / 框 AR)
+# 所以「把图放进槽位框」这个动作本身就是错的。正确做法是先按图片比例算出
+# 适配矩形，再让图框**等于**这个矩形（contain 与 cover 在此时重合，歧义消失）。
+#
+# 规划器其实已经声明了 allowed_transformations.preserve_visual_aspect = true，
+# 只是没人执行它 —— 这一节就是执行者。
+
+def img_size(path: str):
+    """读 PNG / JPEG / GIF / BMP / WebP 的像素尺寸。纯标准库，不引 Pillow。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+            if head[:2] == b"\xff\xd8":                       # JPEG：扫 SOFn 段
+                f.seek(2)
+                while True:
+                    b = f.read(1)
+                    while b and b != b"\xff":
+                        b = f.read(1)
+                    while b == b"\xff":
+                        b = f.read(1)
+                    if not b:
+                        return None
+                    marker = b[0]
+                    if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                        continue
+                    ln = int.from_bytes(f.read(2), "big")
+                    if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                        d = f.read(5)
+                        return int.from_bytes(d[3:5], "big"), int.from_bytes(d[1:3], "big")
+                    f.seek(ln - 2, 1)
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                return int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little")
+            if head[:2] == b"BM":
+                return int.from_bytes(head[18:22], "little"), int.from_bytes(head[22:26], "little")
+            if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+                if head[12:16] == b"VP8X":
+                    w = int.from_bytes(head[24:27], "little") + 1
+                    h = int.from_bytes(head[27:30], "little") + 1
+                    return w, h
+                if head[12:16] == b"VP8 ":
+                    return (int.from_bytes(head[26:28], "little") & 0x3FFF,
+                            int.from_bytes(head[28:30], "little") & 0x3FFF)
+    except Exception:
+        return None
+    return None
+
+
+def fit_rect(iw: float, ih: float, bw: float, bh: float):
+    """把 iw×ih 等比缩放（contain）进 bw×bh，返回 (w, h)（保留 2 位）。"""
+    if not all(x and x > 0 for x in (iw, ih, bw, bh)):
+        return None
+    s = min(bw / iw, bh / ih)
+    return round(iw * s, 2), round(ih * s, 2)
+
+
+def resolve_asset(src: str, bases: list):
+    """按候选基目录找资产文件，返回绝对路径或 None。"""
+    if not src:
+        return None
+    if os.path.isabs(src):
+        return src if os.path.isfile(src) else None
+    for b in bases:
+        if not b:
+            continue
+        p = os.path.normpath(os.path.join(b, src))
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def image_frames(src: str):
+    """
+    遍历 SlideDSL，返回 [(src_path, frame_w, frame_h, origin)]。
+    图框取「图片自身几何」，没有就用最近的、有数值宽高的祖先 Box。
+    origin ∈ {'self', 'box', None}
+    """
+    res = []
+
+    def walk(s: str, inherited):
+        i = 0
+        while True:
+            m = TAG_RE.search(s, i)
+            if not m:
+                return
+            tag, attr, selfclose = m.group(1), m.group(2), m.group(3)
+            inner, nxt = "", m.end()
+            if not selfclose:
+                close = s.find("</%s>" % tag, m.end())
+                if close != -1:
+                    inner = s[m.end():close]
+                    nxt = close + len(tag) + 3
+            _, _, w, h = geom_of(parse_style(attr))
+            if tag == "Image":
+                sm = re.search(r'src="([^"]+)"', attr)
+                if w and h:
+                    fr = (w, h, "self")
+                elif inherited:
+                    fr = (inherited[0], inherited[1], "box")
+                else:
+                    fr = (None, None, None)
+                if sm:
+                    res.append((sm.group(1), fr[0], fr[1], fr[2]))
+            elif inner:
+                # Slide / Box / 其它容器：几何能数出来就往下传，供 Image 兜底
+                walk(inner, (w, h) if (w and h) else inherited)
+            i = nxt
+
+    walk(src, None)
+    return res
+
+
+# --------------------------------------------------------------------------- #
 # _slots.md 解析
 # --------------------------------------------------------------------------- #
 
@@ -381,6 +524,35 @@ def load_content(path: str) -> dict:
     return out
 
 
+def asset_bases_for(anchor_dir: str, explicit=None):
+    """资产查找基目录：显式路径 > anchor/assets > 父级 > anchor 的同级 assets > anchor > cwd。
+
+    SlideDSL 里通常写 `src="assets/xxx.jpg"`，而 anchor 是 `deck/slides`，
+    所以必须包含 `deck/`（父级）这一项，否则会拼成 `deck/assets/assets/xxx.jpg`。
+    """
+    bases = []
+    for b in (explicit or []):
+        ab = os.path.abspath(b)
+        bases.append(ab)
+        # 兼容两种写法：给「含 assets/ 的项目根目录」，或直接给「assets/ 目录本身」。
+        # SlideDSL 写的是 `src="assets/xxx.jpg"`，所以 base 必须能拼出 <base>/assets/xxx.jpg。
+        if os.path.basename(ab) == "assets":
+            bases.append(os.path.dirname(ab))
+    bases += [
+        os.path.abspath(os.path.join(anchor_dir, "assets")),
+        os.path.abspath(os.path.join(anchor_dir, os.pardir)),
+        os.path.abspath(os.path.join(anchor_dir, os.pardir, "assets")),
+        os.path.abspath(anchor_dir),
+        os.getcwd(),
+    ]
+    out, seen = [], set()
+    for b in bases:
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
+
+
 def cmd_brief(args):
     skel = args.skeleton
     files = sorted(f for f in os.listdir(skel) if f.endswith(".slide") and not f.startswith("_"))
@@ -390,6 +562,7 @@ def cmd_brief(args):
 
     slots_by_page = load_slots(args.slots)
     content = load_content(args.content)
+    asset_bases = asset_bases_for(skel, args.assets)
     total = len(files)
 
     L = []
@@ -409,6 +582,12 @@ def cmd_brief(args):
     L.append("2. 字号 ≥ %.1fpt（这是 S8 自己的下限，版面库的 18pt 在这里不适用）" % args.min_font)
     L.append("3. 单个框内的文字不得明显溢出（按 CJK 宽度估算）")
     L.append("4. 页脚区（y %d–%d）保留，页码 `NN / %02d` 正确" % (FOOTER_TOP, CANVAS_H, total))
+    L.append("5. **图片图框的宽高比必须等于图片文件自身的宽高比**（容差 %.0f%%）。"
+             % (args.tol * 100))
+    L.append("   渲染器对图片**一律按 cover 裁切到图框比例**，`objectFit` 属性无效——"
+             "把图放进一个比例不同的框里，画面就会被裁掉。")
+    L.append("   正确做法：**先按图片比例算出适配矩形，再让图框等于这个矩形**"
+             "（每页的「本页图片」小节已给出算好的尺寸，直接用）。")
     L.append("")
     L.append("## §软目标（参考值，超了也只是 WARN）")
     L.append("")
@@ -468,10 +647,37 @@ def cmd_brief(args):
 
         imgs = [e["src"] for e in elements(src) if e["tag"] == "Image" and e["src"]]
         if imgs:
-            L.append("### 本页图片")
+            L.append("### 本页图片（图框宽高比 = 图片宽高比，否则会被裁切）")
             L.append("")
-            for s in imgs:
-                L.append("- `%s`" % s)
+            L.append("| 图片 | 原始像素 | 图片比例 | 当前图框 | 建议图框 | 不改会裁掉 |")
+            L.append("| :-- | :-- | --: | :-- | :-- | --: |")
+            for srcp, fw, fh, origin in image_frames(src):
+                path = resolve_asset(srcp, asset_bases)
+                dim = img_size(path) if path else None
+                if not dim:
+                    L.append("| `%s` | 未找到文件 | — | — | — | — |" % srcp)
+                    continue
+                iw, ih = dim
+                iar = iw / ih
+                if fw and fh:
+                    far = fw / fh
+                    crop = 1 - min(far / iar, iar / far)
+                    note = "**%.1f%%**" % (crop * 100) if crop > args.tol else "不会裁"
+                    cur = "%dx%d (%.2f)" % (round(fw), round(fh), far)
+                    fit = fit_rect(iw, ih, fw, fh)
+                    sug = ("%dx%d (%.2f)" % (round(fit[0]), round(fit[1]), fit[0] / fit[1])
+                           if fit else "—")
+                    if far < iar:      # 框比图"窄长" → 图会被裁左右
+                        if crop > args.tol:
+                            sug += " · 或把框高改为 %d" % round(fw / iar)
+                    elif crop > args.tol:
+                        sug += " · 或把框宽改为 %d" % round(fh * iar)
+                else:
+                    cur, note = "无固定几何", "—"
+                    fit = fit_rect(iw, ih, 1100, 400)
+                    sug = "由你定（保持 %.2f 的比例）" % iar
+                L.append("| `%s` | %dx%d | %.2f | %s | %s | %s |"
+                         % (srcp, iw, ih, iar, cur, sug, note))
             L.append("")
 
         if content.get(i):
@@ -506,6 +712,8 @@ def cmd_check(args):
     min_font = c.get("minimum_font_pt", 10.5)
     dlo, dhi = c.get("density_target_shapes_per_page", [22, 44])
     ratio = c.get("line_height_ratio", 1.45)
+    tol = float(c.get("image_frame_aspect_tolerance", 0.02))
+    asset_bases = asset_bases_for(args.slides, args.assets)
 
     files = sorted(f for f in os.listdir(args.slides)
                    if f.endswith(".slide") and not f.startswith("_"))
@@ -578,19 +786,51 @@ def cmd_check(args):
         elif n > dhi:
             warns.append("P%02d HIGH_DENSITY: %d 个 > 建议上限 %d（确认不是碎片化）" % (i, n, dhi))
 
+        # 6) 图片图框比例：渲染器按 cover 裁切，比例不符 = 画面被裁
+        bad_img, miss_img = [], []
+        for srcp, fw, fh, origin in image_frames(src):
+            path = resolve_asset(srcp, asset_bases)
+            dim = img_size(path) if path else None
+            if not dim:
+                miss_img.append(srcp)
+                continue
+            if not (fw and fh):
+                continue
+            iw, ih = dim
+            iar, far = iw / ih, fw / fh
+            dev = abs(far - iar) / iar
+            if dev > tol:
+                crop = 1 - min(far / iar, iar / far)
+                fit = fit_rect(iw, ih, fw, fh)
+                bad_img.append((srcp, round(fw), round(fh), iw, ih,
+                                crop * 100, fit))
+        if bad_img:
+            s0 = bad_img[0]
+            fit = s0[6]
+            fix = ("把图框改成 %dx%d 并居中" % (round(fit[0]), round(fit[1]))
+                   if fit else "按图片比例重定图框")
+            fails.append(
+                "P%02d IMAGE_ASPECT_MISMATCH: %d 张图会被裁掉画面，例 `%s` 框 %dx%d vs 图 %dx%d"
+                "（裁 %.1f%%）→ %s"
+                % (i, len(bad_img), s0[0], s0[1], s0[2], s0[3], s0[4], s0[5], fix))
+        if miss_img:
+            warns.append("P%02d IMAGE_UNRESOLVED: 找不到文件 %s（无法校验比例）"
+                         % (i, ", ".join(miss_img[:3])))
+
         rows.append((i, fn, page_title(src), n,
                      min([t["font"] for t in texts if t["font"]] or [0]),
-                     len(tiny), len(oob), len(over)))
+                     len(tiny), len(oob), len(over), len(bad_img)))
 
     W = 96
     print("=" * W)
     print("S8 设计落地 · check   %s" % args.slides)
     print("=" * W)
-    print("%-4s %-26s %6s %8s %8s %8s %8s" % ("页", "标题", "元素", "最小字号", "小字", "越界", "溢出"))
+    print("%-4s %-24s %6s %8s %8s %8s %8s %8s"
+          % ("页", "标题", "元素", "最小字号", "小字", "越界", "溢出", "裁图"))
     print("-" * W)
-    for i, fn, title, n, mf, nt, no, nov in rows:
-        print("%-4d %-26s %6d %8.1f %8d %8d %8d"
-              % (i, (title or fn)[:26], n, mf, nt, no, nov))
+    for i, fn, title, n, mf, nt, no, nov, nb in rows:
+        print("%-4d %-24s %6d %8.1f %8d %8d %8d %8d"
+              % (i, (title or fn)[:24], n, mf, nt, no, nov, nb))
     print("-" * W)
 
     if warns:
@@ -608,11 +848,11 @@ def cmd_check(args):
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write("# S8 设计落地 check 报告\n\n")
-            f.write("| 页 | 标题 | 元素 | 最小字号 | 小字 | 越界 | 溢出 |\n")
-            f.write("| :-- | :-- | --: | --: | --: | --: | --: |\n")
-            for i, fn, title, n, mf, nt, no, nov in rows:
-                f.write("| P%02d | %s | %d | %.1f | %d | %d | %d |\n"
-                        % (i, title or fn, n, mf, nt, no, nov))
+            f.write("| 页 | 标题 | 元素 | 最小字号 | 小字 | 越界 | 溢出 | 裁图 |\n")
+            f.write("| :-- | :-- | --: | --: | --: | --: | --: | --: |\n")
+            for i, fn, title, n, mf, nt, no, nov, nb in rows:
+                f.write("| P%02d | %s | %d | %.1f | %d | %d | %d | %d |\n"
+                        % (i, title or fn, n, mf, nt, no, nov, nb))
             f.write("\n## WARN\n\n" + ("\n".join("- " + w for w in warns) or "无"))
             f.write("\n\n## FAIL\n\n" + ("\n".join("- " + f for f in fails) or "无"))
         print("报告 → %s" % args.out)
@@ -643,6 +883,9 @@ def main():
     p.add_argument("--skeleton", required=True, help="骨架 .slide 目录")
     p.add_argument("--slots", default=None, help="_slots.md 路径")
     p.add_argument("--content", default=None, help="可选补充素材 md/json")
+    p.add_argument("--assets", nargs="*", default=None, help="图片资产根目录（可多个）")
+    p.add_argument("--tol", type=float, default=DEFAULT_CONTRACT["image_frame_aspect_tolerance"],
+                   help="图片图框宽高比容差，默认 0.02")
     p.add_argument("--out", default=None)
     p.add_argument("--min-font", type=float, default=DEFAULT_CONTRACT["minimum_font_pt"])
     p.add_argument("--density", nargs=2, type=int,
@@ -652,6 +895,7 @@ def main():
     p = sub.add_parser("check", help="校验落地页")
     p.add_argument("--slides", required=True, help="落地页 .slide 目录")
     p.add_argument("--contract", default=None, help="design_contract.json 路径")
+    p.add_argument("--assets", nargs="*", default=None, help="图片资产根目录（可多个）")
     p.add_argument("--out", default=None, help="报告 md 路径")
     p.add_argument("--strict", action="store_true", help="WARN 也算失败")
     p.set_defaults(func=cmd_check)

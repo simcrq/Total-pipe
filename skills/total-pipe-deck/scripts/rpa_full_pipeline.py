@@ -275,6 +275,9 @@ def main():
                     help="preflight 的 renderer_inputs.platform，默认跟随宿主机"
                          "（写死 win32 在非 Windows 机器上会报 PROJECT_PATH_NOT_DRIVE_ABSOLUTE）")
     ap.add_argument("--theme", default="paper_blue")
+    ap.add_argument("--design-assets", default="",
+                    help="S8 图片资产根目录（含 assets/ 的目录，或 assets/ 目录本身；"
+                         "brief/check 用它读图片真实像素算适配矩形）")
     ap.add_argument("--presentation-type", default="group_meeting")
     ap.add_argument("--slide-count", type=int, default=0, help="目标页数提示（实际由 briefs 数决定）")
     ap.add_argument("--detail-level", default="compact")
@@ -699,6 +702,11 @@ def main():
             slots_md = os.path.join(skel_dir, "_slots.md")
             if os.path.isfile(slots_md):
                 cmd += ["--slots", slots_md]
+            # 图片资产根目录：默认按 skel/../assets 猜；给了 --design-assets 就显式指定。
+            # brief 会读图片真实像素，为每张图算出「图框宽高比 = 图片比例」的适配矩形。
+            design_assets = getattr(args, "design_assets", None)
+            if design_assets:
+                cmd += ["--assets", design_assets]
             cb = subprocess.run(cmd, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace")
             if cb.returncode == 0:
@@ -707,9 +715,11 @@ def main():
                            args.min_font, dlo, dhi))
                 print("        · 契约   → %s" % contract_path)
                 print("        · 任务书 → %s" % brief_out)
+                print("        · ⚠ 图片图框宽高比必须 = 图片文件自身比例，否则被 cover 裁掉")
                 print("        · 下一步：按任务书在槽位内部做设计落地，然后")
-                print("          python %s check --slides <落地页目录> --contract %s"
-                      % (os.path.join(here, "design_land.py"), contract_path))
+                print("          python %s check --slides <落地页目录> --contract %s%s"
+                      % (os.path.join(here, "design_land.py"), contract_path,
+                         (" --assets " + design_assets) if design_assets else ""))
             else:
                 record("S8", "设计落地准备", "WARN",
                        (cb.stdout or cb.stderr or "")[-200:].replace("\n", " "))

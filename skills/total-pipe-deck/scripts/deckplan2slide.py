@@ -93,11 +93,17 @@ TPL_TEXT = """  {/* [%(sid)s] %(label)s%(cap)s · %(fs)dpx */}
   </Box>
 """
 
-# 图片槽：可选卡片底
-TPL_IMAGE = """  {/* [%(sid)s] %(label)s%(cap)s */}
+# 图片槽：可选卡片底。
+# ⚠ 渲染器（slidep）对图片**一律按 cover 裁切到图框比例**，`objectFit` 属性无效。
+# 所以「把图铺满槽位框」= 裁掉画面。落地（S8）时必须把图框改成图片自身的比例，
+# 再把图卡按适配矩形居中（见 S8 design_land.py 的 brief/check；
+# check 对比例不符的图判 FAIL: IMAGE_ASPECT_MISMATCH）。
+# 骨架阶段还不知道用哪张图，这里只报出槽位框的宽高比，供落地层比对。
+TPL_IMAGE = """  {/* [%(sid)s] %(label)s%(cap)s · 图槽宽度比 %(ar)s */}
+  {/* ⚠ 图框宽高比必须 = 图片文件自身比例，否则被 cover 裁掉（见设计任务书「本页图片」） */}
   <Box style={{ %(pos_bar)s, background: '%(bar_c)s' }} />
-  <Box style={{ %(pos)s%(card)s }}>
-    <Image src="assets/TODO.png" style={{ width: '100%%', height: '100%%', objectFit: 'contain' }} />
+  <Box style={{ %(pos)s%(card)s, flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+    <Image src="assets/TODO.png" style={{ width: '100%%', height: '100%%' }} />
   </Box>
 """
 
@@ -219,6 +225,7 @@ def render_slot(slot, overlap=False):
         "border": THEME["border"], "panel": THEME["panel"],
         "accent1": THEME["accent1"], "fade": _fade(THEME["accent1"]),
         "color": THEME["text"], "weight": "normal",
+        "ar": ("%.2f" % (w / h)) if h else "?",
     }
     if stype in TABLE_TYPES:
         return TPL_TABLE % ctx

@@ -170,6 +170,8 @@ python "$DL" contract --out design_contract.json --min-font 10.5 --density 22 44
 python "$DL" brief --skeleton slides/ --slots slides/_slots.md --out slides/_design_brief.md
 # —— 这里由 Agent 按任务书自由发挥，改写/扩写 slides/*.slide（构图不受脚本约束）——
 python "$DL" check --slides slides/ --contract design_contract.json --out _design_check.md
+# 图片资产不在默认位置时用 --assets 指路（可给多个；给「含 assets/ 的目录」或 assets/ 本身都行）：
+#   python "$DL" check --slides deck/slides --assets deck/assets
 ```
 
 `rpa_full_pipeline.py` 的 S8 已把 contract + brief 一并跑掉，所以一键跑完就有任务书；
@@ -178,12 +180,39 @@ python "$DL" check --slides slides/ --contract design_contract.json --out _desig
 **关键：脚本不代写设计。** `brief` 只给三类东西——
 
 1. **事实**：每槽 bbox / 容量 / 已用字数 / 未覆盖的空白带 / 本页图片路径
+   **+ 每张图的原始像素、图片比例、当前图框、建议图框、不改会裁掉多少**
 2. **软目标**：密度区间（默认 22–44 个元素/页）、字号阶梯、可按需覆盖
 3. **语汇货架**：顶栏标签 / 图注 / 脚注引文 / 指标双列 / 序号徽章 / 关键词高亮 /
    来源标注 / 对比条 / 流程箭头 / 分隔留白 —— **是"货架"不是"清单"，可全不用，可自创**
 
-`check` 只卡 4 项**物理不可行**（画布越界 / 字号低于下限 / 文字溢出 / 页脚与页码），
-密度与构图只 WARN。`--strict` 才把 WARN 算失败。
+`check` 只卡**物理不可行**项（画布越界 / 字号低于下限 / 文字溢出 / 页脚与页码 /
+**图片图框比例 ≠ 图片比例**），密度与构图只 WARN。`--strict` 才把 WARN 算失败。
+
+#### ⚠ 图片：图框宽高比必须 = 图片文件自身比例（v1.1.0 起进 check）
+
+**这是最容易被忽略、后果最直观的一条。** slidep 的 pptx 写出端对图片
+**一律按 cover 裁切到图框比例**：
+
+- `objectFit` 写 prop 也好、写在 `style` 里也好，填 `contain` / `cover` / `fill`
+  —— 产出**逐字节相同**，属性完全无效（已用 5 变体探针实测）
+- 唯一影响裁切量的是**图框自身的宽高比**：`裁切比 = 1 − min(框AR/图AR, 图AR/框AR)`
+- 实例：`440×209` 的图（AR 2.11）放进 `1107×318` 的槽（AR 3.48）→ 上下各裁 **19.76%**，
+  器件截面图的顶部标签与底部衬底**双双被切掉**
+
+所以**「把图铺满槽位框」这个动作本身就是错的**。正确顺序是：
+
+1. 读图片真实像素（`design_land.py` 自带 PNG/JPEG/GIF/BMP/WebP 头解析，纯标准库）
+2. 按图片比例算 contain 适配矩形 `fit_rect(iw, ih, box_w, box_h)`
+3. **让图框等于这个矩形**（contain 与 cover 在此时重合，歧义消失），在槽位内居中
+4. 图卡 = 适配矩形 + padding；**腾出来的空档要用真实内容填**（参数表 / 指标行），
+   而不是让大卡片空着 —— 否则 `element_area_ratio` 反而掉下来
+
+`brief` 已为每张图算好建议尺寸，直接抄；`check` 对偏差 >2% 的图判
+`IMAGE_ASPECT_MISMATCH`（FAIL）并给出应改成的具体尺寸。
+`deckplan2slide.py` 的图槽注释里也会打印**槽位框的宽高比**供落地层比对。
+
+> 规划器其实已经声明了 `allowed_transformations.preserve_visual_aspect = true`，
+> 只是此前**没有任何一环执行它** —— S8 就是执行者。
 
 **版面库实测天花板**（`research-ppt-assistant/assets/layout-library/layouts.json` v2.0.0）：
 
@@ -414,6 +443,33 @@ python "$DL" check --slides slides/ --contract design_contract.json
 
 `check` 退出码非 0 就别往下渲染。
 
+> ⚠️ **中文渲染空白：落地页必须"一框一行"**（实测踩过，务必先读）
+>
+> slidep 的转换器**只在「内容放不进一个框」时**才写 `wrap="square"` + `<a:normAutofit/>`；
+> 而 `normAutofit` 会让 LibreOffice / WPS 把**中文 run 渲染成空白**（对照实验：删掉
+> normAutofit 中文立刻恢复）。单行框走 `wrap="none"` 分支，没有 normAutofit。
+>
+> 所以自写落地脚本时：**由脚本自己断行，每个 `<Text>` 只放一行**。断行必须
+> **token 感知** —— 按字符贪心会把"不可分记号"拦腰斩断，实测出现过
+> `Ωμ|m`、`EV00|61`、`TM|DC`、`MoS|₂`、`V_g(rea|d)`、`L| = 100 nm`。
+> 正确做法：CJK 逐字切，**非 CJK 连续串整体不可分**（单位 / 缩写 / 证据号 /
+> 下标上标 / `_ ( ) = + - / · →`），再把「数字 + 拉丁单位」胶合（`440 Ωμm` / `270 nm`）；
+> 最后加中文**避头尾**：闭合标点（。，、；：）」）不得起行（放不下就把行末 token
+> 一起挪下去），开括号不得落行尾。收尾用 `slidep-validate` 兜底（**别加**
+> `--no-overflow-check`）。
+>
+> 验收门槛：交付 pptx 里 `<a:normAutofit/>` 计数应为 **0**、`wrap="square"` 应为 **0**。
+>
+> 另一条同源约束：**别把 `EV####` 印在台面上**。RPA 会判 `EVIDENCE_ID_LEAKED_TO_SLIDE`
+> （「汇报页不应暴露内部溯源元数据」），而 `pipe_coverage_audit` 的 `evidence_trace`
+> 又要求 slide 源里有 EV 号 —— 两条门禁看似冲突，**分层即可两全**：EV 号只写进
+> `.slide` 的**文件头注释**，台面上放论文图号 / 主题词。实测 13 页泄漏 warning 清零，
+> `evidence_trace` 仍 PASS。
+>
+> （机制说明：slidep 会把整份 `.slide` 源塞进 `p:cNvPr/@descr` 属性，属**元数据**、
+> 不产生可见文本 —— 所以注释里的 EV 号既满足审计读源码，又不会被 QA 判泄漏。
+> 已用 PDF 文本抽取 + `run_qa.py` 双向确认 14 页零可见泄漏。）
+
 **4a. 渲染前**
 
 ```bash
@@ -491,7 +547,7 @@ node server/cli.mjs validate-rendered-deck    --file rendered-deck.json
 | `normalize_content` | `status`（应为 `valid`）、`violations`（应为 `[]`）、`source_count` / `citation_count` / `evidence_count` / `slide_brief_count` |
 | `create_deck_plan` / `cli plan` | 顶层 `pipeline_status`（应为 `plan_complete`）、`production_status`、`design_status`、`design_score`、`deck_title`、`theme_id`、`slide_count`；每页在 `slides[].index` / `slide_id` / `category` / `layout_id` / `visual_treatment` / `aesthetic_score` |
 | `design_land.py brief` | `_design_brief.md`：每页槽位 bbox / 容量 / 已用字数 / **未覆盖空白带** / 图片 / 语汇货架。**没有"必须画什么"** |
-| `design_land.py check` | 表头四列 `元素 / 最小字号 / 小字 / 越界 / 溢出`；`FAIL` 只有 4 种码：`FONT_TOO_SMALL` / `OUT_OF_CANVAS` / `TEXT_OVERFLOW` / 页脚页码缺失 |
+| `design_land.py check` | 表头八列 `元素 / 最小字号 / 小字 / 越界 / 溢出 / 裁图`；`FAIL` 有 5 种码：`FONT_TOO_SMALL` / `OUT_OF_CANVAS` / `TEXT_OVERFLOW` / 页脚页码缺失 / `IMAGE_ASPECT_MISMATCH`（附「应改成 WxH」的建议）；`IMAGE_UNRESOLVED` 只 WARN |
 
 健康基线：`status=valid` + `violations=[]` + `pipeline_status=plan_complete`。
 不达标说明上游有问题，往回查，别在阶段 3 里硬调。
@@ -535,11 +591,27 @@ paperworkflow 同理，python 换成 `F:/Workbuddy/Total-pipe/paperworkflow/.ven
 | slidep upsert-dsl 报 `10201 Export file is occupied` | pptx 正被编辑器/预览占用 | 先 upsert 到 `_v2.pptx` 副本，再用 `cp` 覆盖原文件（cp 能成功） |
 | 分隔线被判 `ORPHAN_DECORATIVE_ELEMENT` | 宽高比 ≥18 且面积占比 ≤0.02 的 decoration 元素 | 直接删掉分隔线、改用间距分组（加粗到 22px 才不算 thin，不划算） |
 | **成品"太空旷"**：文字飘在白底上，看不到卡片/竖条/装饰 | **根因是缺「设计落地层」，不是缺装饰。** 快路径 S4 出骨架 → 直接 `slidep start`，中间没有 S8 那一站。骨架忠实执行版面库契约（每页 4–8 槽、正文 18pt 下限）→ 必然空旷 | 补跑 S8：`design_land.py brief` 出任务书 → Agent 在槽位内做设计落地 → `check` 验收。详见「S8 设计落地层」节 |
+| **图片被上下/左右裁掉一截**（图里的标签、图例、坐标轴没了；文字没丢，是画面没了） | slidep 的 pptx 写出端**对图片一律按 cover 裁切到图框比例**，`objectFit` 属性无效（prop/style × contain/cover/fill 五种写法产出逐字节相同）。把图铺满一个比例不同的槽位框 = 必然裁掉长边那一维。判据：pptx 里 `<a:srcRect>` 非零，且 `裁切比 = 1 − min(框AR/图AR, 图AR/框AR)` 完全对得上 | 让**图框宽高比 = 图片文件自身比例**：算 contain 适配矩形 → 图框取该矩形 → 在槽位内居中；图卡 = 适配矩形 + padding，腾出的空档用真实内容（参数表/指标行）填。`design_land.py check` 会判 `IMAGE_ASPECT_MISMATCH` 并给出应改尺寸 |
+| 图片明明在框里居中留白了，`element_area_ratio` 反而掉下来 | 该指标只算**带文本元素 + 图片**的并集，纯色卡片不计；图按比例缩小后图片 bbox 变小 | 把图卡腾出的空档用**带文字的**内容填满（参数行 / 指标行 / 图注），别只留白 |
+| 骨架的图槽注释写着"图槽宽度比 3.16"，但落地时找不到该塞什么比例的图 | `deckplan2slide.py` 只报槽位框比例，不知道你会用哪张图 | 先在 `briefs.json` 的 `visuals` 定好图（或落地层自己选图），再用 `design_land.py brief` 读真实像素算适配矩形 |
 | pptx **只有形状、文字与图全空**（size ≈39KB、`ppt/slides/media` 为空、`<a:t>` 全空但 shapes 数正常） | `editor_sdk` 对**同一输出路径**反复 open/purge/commit 后会话变脏 | **换一个新的输出文件名**重渲即可（会话按 file_path 管理）。**不要 kill editor_sdk** |
 | `slidep stop` 报 `nothing to stop: pid file not found`，日志里多个 pid 交替 removeSlide/addSlide、页数翻倍 | `rm -rf <project>/.slidep` 把 pid 文件一起删了，旧 daemon 仍在跑 → 多 daemon 互殴 | 清理顺序必须**先 stop 再 rm**；已乱则 `pkill -f slidep` 后单实例重启 |
 | `slidep start` 报 `openFile network error: fetch failed` | `editor_sdk`（端口 39099，env `TENCENT_DOCS_LOCAL_MCP`）未运行。它是 WorkBuddy 宿主的本地编辑器服务，**没有自启命令** | 不要 kill 该进程；若已挂，等宿主自动拉起（实测约 30 分钟）后重试 |
 | 封面必然报 `EXCESSIVE_WHITESPACE`（element_area_ratio <0.18 fail / <0.35 warn） | 该指标**只统计文字/图片元素的 bbox，纯色卡片不计入**，且不区分 category | 封面按"主视觉式"版面意图放一条关键成果带（大数字 + 小标签三档），而非一行小字 |
+| 转出的 pptx 里中文**整段空白** | slidep 只对「放不进一框」的内容写 `wrap="square"` + `<a:normAutofit/>`，normAutofit 会让 LibreOffice / WPS 把中文 run 渲染成空白 | 落地脚本**自己断行**、每框一行（详见阶段 4 的「中文渲染空白」提示）。自查：pptx 里 `normAutofit` 与 `wrap="square"` 计数都应为 0 |
+| 断行把单位/编号/下标**拦腰斩断**（`Ωμ\|m`、`EV00\|61`、`MoS\|₂`、`L\| = 100 nm`） | 按字符贪心断行，没有"不可分记号"概念 | 改 token 感知断行：CJK 逐字、非 CJK 连续串整体不可分，再胶合「数字+拉丁单位」，并加避头尾（闭合标点不起行） |
+| 遥测报 `EVIDENCE_ID_LEAKED_TO_SLIDE`（台面出现 `EV####`） | RPA 认为汇报页不该暴露内部溯源元数据；但 `pipe_coverage_audit` 的 `evidence_trace` 又**要求** slide 源里有 EV 号，两条门禁看似冲突 | **分层**：EV 号只写进 `.slide` 的**文件头注释**（渲染器不输出注释），台面改放论文图号/主题词。实测 13 页泄漏 warning 清零，`evidence_trace` 仍 PASS |
 | 主题化后出现 `ELEMENT_COLLISION`（卡片互相遮挡） | 版面库存在**层叠式版面**（如 RM-GAP-04 的 gap/ours 与 contribution 上下叠 79px），实体卡会判碰撞 | 与其它槽重叠 >10% 的槽不加卡片底（`slice_flags()`），并把文字改顶部对齐，避免落进邻卡 |
+| **封面**一次报七条 `ELEMENT_COLLISION` | 封面也走了母版 `header()`：kicker 与页标题上下重叠 ~10px，且 y=112 的 `1140×1` 发丝线正好横穿主图卡与右侧指标卡 | 封面**关掉页眉**（`page(..., head=False)`，加一个 `head` 开关），只留眉标 + 主视觉标题；顺带消掉"标题重复" |
+| 图注下半行被下方卡片盖掉（肉眼看是"字被切了一半"） | 图注框高 = `ceil(1.2×13) = 16`，放在图卡下缘 +8 处，而下方卡片上缘只留了 13.6px 空档 → 卡片白底盖住图注下半行（`fail`，ratio 0.10–0.81） | 图注框上边 = **图卡下缘 + 4**，且图注框下边 ≤ **下一元素上缘 − 2**；空档不够就把图卡压低 10–20px 腾出位置 |
+| 结论条 / 尾句被页脚发丝线横穿（ratio ≈ 1.0） | 元素越过了 y=660 的页脚线；发丝线宽 1140 **不会**被含容过滤豁免（它比内容框宽） | 内容区下界收到 **656**；每页用构造期自检兜底（见下一条） |
+| 落地脚本反复"渲染 → 遥测 → 改"效率很低 | 每轮都要跑 sidecar + QA 链 | 在落地脚本里**登记元素几何**（Box 与 Text 各记一条），用一份 `check.py` 复刻 `pairwise_collision` 的判定并估算 `element_area_ratio`，**构建期收敛到 0 FAIL** 再渲染。Text 的 bbox 口径见 pptx-telemetry SKILL.md 特例 6/7（居中的紧行框 `h=ceil(1.2×fontSize)`、`w`=外层 Box 宽） |
+| 遥测 `EXCESSIVE_WHITESPACE` 卡在 0.18 线附近（如 0.178 fail） | 该指标**只统计带文本元素的并集**，纯色卡片、对比条、进度条一概不计 → 看板页的条形图撑不起来 | 补一行**带文本**的指标（顺便把页做完整），或加宽文本框；不要靠加装饰 |
+| 弱化灰字被判 `TEXT_CONTRAST_LOW`（实测 4.08–4.27） | `#64748B` 在 `#EEF3FA` / `#E8EEF7` 上低于 4.5 触发线 | 弱化色加深到 `#4E5A70`（在各底色上 ≥5.96），配色语义不变 |
+| 覆盖率门禁报 `plan_freshness` FAIL | `slides/` 的 mtime 晚于 `deck_plan.json`——S8 设计落地必然改 slides，这条**几乎必然触发** | **重跑 plan 再落盘**：`cd <rpa-root> && node server/cli.mjs plan --file <rpa_input.json> --presentation-type <pt> --detail-level <dl>`，与旧 plan 做 JSON **深比对**确认页数/score/版面/分类零差异后再覆盖。别只 `touch` |
+| 覆盖率门禁报 `stage3_full` FAIL，但报告明明跑过 | `_pipeline_report.md` 落在 `<out-dir>/_rpa/`，而审计只看 `<project>/_rpa/` 与 `<project 父目录>/_rpa/` | 让 `--out-dir` 指向 **deck 的父目录**（或收工时把 `_rpa/` 挪到父目录） |
+| 覆盖率门禁报 `story_pages` / `design_pages` WARN | 审计用 `### P\d+` 或 `\bP\d{1,2}\b` 抓页号，而 STORY/DESIGN 的页号列只写了 `01`/`02` | 页号列改成 `P01..Pnn` |
+| `slidep script` 报 `Unknown command: script` | v6.1.0 里 script 是**独立可执行** `slidep-script`，不是 `slidep` 的子命令（`create` / `upsert-dsl` 才是子命令） | 用 `slidep-script -e "<code>" --file-path <pptx>`。脚本里 `Logger` 未定义会报错，但 `presentation.save()` 已先执行，exit 0 即视为已保存 |
 | JSX 报 `Unterminated regexp literal` | 文本里有**裸 `>`**（如"耐久 >60,000"） | 改写成"耐久超 60,000"等不含 `>` 的表述 |
 | slidep-export-images 报 504 / `upload credential failed` | 该命令依赖 docs.qq.com **在线**转换服务 | 非本地故障，稍后重试；验证结论以 QA 链为准，不要只靠导图 |
 
@@ -609,7 +681,6 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_
 - **pwf2rpa**：默认兜底 briefs 常质量不佳（占位标题），人工重写后它就退化成**纯格式校验器**。重写 briefs 是合理的，但要清楚此时 `convert` 的自动映射价值≈0。
 - **research_ppt**：有 20 个 MCP 工具 + 20 个 CLI 命令，通常只用 `normalize-content` / `plan` / `validate-deck` 三个。版面库 320 个版面、以及 `preflight` / `figure-placement` / `group-fit-preflight` / `visual-fit-preflight` / `visual-quality` 这一串**渲染前预检**经常被跳过——而它们恰好是防碰撞的第一道闸。
 - **tencent-pptx**：组件有 14 个（box/text/image/**table**/chart/diagram/svg/faicon/math/codeblock/qrcode/hyperlink/animation/slide），实际常只用 4 个。表格类页面**务必用 `component-table.md` 的原生 Table**，不要用 Box+Text 手搭——手搭会被 QA 判 `EXCESSIVE_WHITESPACE`，且对齐难控。
-
 
 ---
 
