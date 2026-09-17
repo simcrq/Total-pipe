@@ -3,7 +3,8 @@
 
 Evidence provenance (disclosed per field):
   measured_ooxml : geometry (EMU->px exact), fills, run colors, font
-                   family/size/bold, wrap, insets, lnSpc, image crop
+                   family/size/bold (including paragraph-default a:defRPr),
+                   wrap, insets, lnSpc, image crop
                    (srcRect), image sha256 + source dims, z-order
   measured_meta  : slide background parsed from slidep JSX descr (if present),
                    else default white
@@ -146,6 +147,52 @@ def solid_hex(el):
         return None
     c = el.find(".//a:solidFill/a:srgbClr", NS)
     return c.get("val") if c is not None else None
+
+
+def inherited_run_attr(inline, default, name, fallback=None):
+    """Resolve a run attribute with a:pPr/a:defRPr as the fallback.
+
+    DrawingML permits a paragraph to provide default run properties through
+    ``a:defRPr`` while an individual ``a:rPr`` only contains overrides.  The
+    effective value is therefore property-by-property, not element-by-element.
+    """
+    for props in (inline, default):
+        if props is not None and props.get(name) is not None:
+            return props.get(name)
+    return fallback
+
+
+def inherited_run_child(inline, default, path):
+    """Resolve a child run property with a:defRPr fallback."""
+    for props in (inline, default):
+        if props is not None:
+            child = props.find(path, NS)
+            if child is not None:
+                return child
+    return None
+
+
+def resolve_run_style(paragraph, run):
+    """Return effective OOXML run style, including paragraph defaults.
+
+    artifact-tool commonly emits font size, bold, color, and typeface on
+    ``a:pPr/a:defRPr`` instead of repeating them in every ``a:rPr``.  Reading
+    only the inline element makes valid text look like it has the parser's
+    fallback defaults and can create false overflow/readability findings.
+    """
+    ppr = paragraph.find("a:pPr", NS)
+    default = ppr.find("a:defRPr", NS) if ppr is not None else None
+    inline = run.find("a:rPr", NS)
+    size = int(inherited_run_attr(inline, default, "sz", "1800"))
+    bold = inherited_run_attr(inline, default, "b") == "1"
+    color = solid_hex(inline) or solid_hex(default)
+    latin = inherited_run_child(inline, default, "a:latin")
+    return {
+        "size": size,
+        "bold": bold,
+        "color": f"#{color.upper()}" if color else None,
+        "typeface": latin.get("typeface") if latin is not None else None,
+    }
 
 
 def gradient_hexes(el):
@@ -357,16 +404,11 @@ def parse_slide(z, n, rels_map, slide_bg):
                 runs = p.findall("a:r", NS)
                 ptxt = ""
                 for rn in runs:
-                    rPr = rn.find("a:rPr", NS)
-                    sz = int(rPr.get("sz", "1800")) if rPr is not None else 1800
-                    max_sz = max(max_sz, sz)
-                    if rPr is not None and rPr.get("b") == "1":
-                        bold_any = True
-                    c = solid_hex(rPr) if rPr is not None else None
-                    color = color or (f"#{c.upper()}" if c else None)
-                    if rPr is not None:
-                        f = rPr.find("a:latin", NS)
-                        face = face or (f.get("typeface") if f is not None else None)
+                    style = resolve_run_style(p, rn)
+                    max_sz = max(max_sz, style["size"])
+                    bold_any = bold_any or style["bold"]
+                    color = color or style["color"]
+                    face = face or style["typeface"]
                     t = rn.find("a:t", NS)
                     ptxt += t.text or "" if t is not None else ""
                 paras.append(ptxt)

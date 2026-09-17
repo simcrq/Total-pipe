@@ -1,6 +1,6 @@
 {
   "name": "total-pipe",
-  "version": "1.0.0+codex.20260917113321",
+  "version": "1.0.0+codex.20260917140517",
   "description": "End-to-end research-paper to presentation workflow with evidence, layout, rendering, and PPTX telemetry stages.",
   "author": {
     "name": "Total-pipe"
