@@ -1,7 +1,6 @@
 ---
 name: total-pipe-deck
 description: 从论文 PDF 到研究汇报 PPT 的三段式流水线（paperworkflow → pwf2rpa → research_ppt）。当用户要"把这篇论文做成汇报/组会 PPT""从 PDF 生成 slides""跑通 Total-pipe"时使用。
-agent_created: true
 ---
 
 # Total-pipe：论文 → 研究汇报 PPT
@@ -9,10 +8,19 @@ agent_created: true
 三段流水线，各段是一个 MCP 连接器。**本文件就是调用契约，不要再去读连接器源码。**
 
 ```
-paperworkflow          pwf2rpa            research_ppt          render (slidep)        pptx-telemetry
+paperworkflow          pwf2rpa            research_ppt          render（分支）          telemetry + QA
 PDF → 证据注册表  →  加 slide_briefs  →  选版面 / 规划    →    deck.pptx     →    OOXML 遥测 + QA
 workflow.json          rpa_input.json       deck_plan.json                                 sidecar / QA 报告
 ```
+
+渲染只能在 `deck_plan.json` 已完成后选择一个下游分支：
+
+| 分支 | 交付渲染器 | 设计落地与遥测门禁 |
+|---|---|---|
+| `slidep` | slidep / tencent-pptx | `deckplan2slide.py` 骨架 → S8 设计落地 → `pptx-telemetry` |
+| `artifact-tool` | Presentations + `@oai/artifact-tool` | 直接按 `deck_plan` 槽位、treatment 与 decoration 生成 → `artifact-telemetry` → `pptx-telemetry` |
+
+两条分支是**等价的替代路径，不是可任选跳过的步骤**。不得用 artifact-tool 在没有计划约束的情况下自由手写一份 PPT，也不得要求 artifact-tool 再伪造 `.slide` 骨架。
 
 | 段 | 连接器 | 位置 |
 |---|---|---|
@@ -36,9 +44,9 @@ workflow.json          rpa_input.json       deck_plan.json                      
 `deck_plan.json` 沦为一次性产物。**根因不是 Agent 偷懒，是渲染层不消费 deck_plan
 ——slidep 吃手写 SlideDSL，Agent 完全可以绕开规划。**
 
-现在用「骨架生成器」把这条路堵死，见下面阶段 4 的硬约束。
+slidep 分支用「骨架生成器」防止绕开规划；artifact-tool 分支用不可省略的 plan-to-layout 映射和 layout/v4 遥测防止同一问题。
 
-### 阶段 3 必须按序跑完（缺一步不许进阶段 4）
+### slidep 分支：阶段 3 必须按序跑完（缺一步不许进阶段 4）
 
 **首选方式：一条命令跑完，别手敲：**
 
@@ -129,7 +137,7 @@ $NODE server/cli.mjs preflight      --file preflight-input.json
 过关线：`pipeline_status == preflight_complete` 且 `status != invalid`，无重复 pageId。
 页面带科研图必跑 `visual-fit-preflight`；同页多图有语义关系时补 `group-fit-preflight`。
 
-### 阶段 4 只能从骨架开始（硬约束，这是关键机制）
+### slidep 分支：阶段 4 只能从骨架开始（硬约束，这是关键机制）
 
 ```bash
 python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/deckplan2slide.py" \
@@ -231,6 +239,18 @@ python "$DL" check --slides slides/ --contract design_contract.json --out _desig
 **QA 全绿 ≠ 好看**。必须出图目视验收。
 
 ---
+
+### artifact-tool 分支：从 `deck_plan` 到交付 PPTX（硬约束）
+
+当用户指定 **Presentations + artifact-tool** 时，不走 SlideDSL 骨架；但以下门禁全部必需：
+
+1. **共同上游先通过。** `normalize-content` 必须 `valid`，`create_deck_plan` 必须 `pipeline_status: plan_complete`，并用 `validate_deck_plan` 复核为 `valid`。计划中的 `layout_id`、`slot_specs`、`slot_assignments`、`visual_treatment` 与 `decoration_profile` 是渲染输入，不是灵感参考。
+2. **建立逐页 plan-to-layout 映射。** 生成器必须为每个 `slide_id` 保存选用的 layout、槽位到 artifact-tool 元素的映射、证据/图资产映射，以及任何允许的 S8 级槽内再排版。不得删除主要结论、主证据、强制引用或 `must_keep` 内容；裁短仅限支持性文字并记录原因。
+3. **用 Presentations 技能生成交付物。** 以 `@oai/artifact-tool` 生成可编辑 `.pptx`；保留演讲者备注中的来源和证据引用。科研图按真实素材比例 `contain` 或等比例 frame 放置，不得为填满槽位裁掉坐标轴、标注或样品区域。可见页面不得暴露 `EV####`。
+4. **完成 artifact-tool 遥测闭环。** 生成未改写的 `openai.presentation.layout/v4` 输出，并为每张科研图提供稳定 `visual_key`（图片 alt 使用 `rpa:<visual_key> | 描述`）、真实资产 SHA-256、源尺寸、容器 shape 名称、图像类型、panel 数与嵌字状态。调用 `artifact-telemetry`：`render_layouts.mjs` → `build_sidecars.py` → `run_qa.py`。`pass` 可自动放行；`manual_review_required` 须记录人工检查；`fail` 或 `blocked` 必须修复或如实停止，不能用“目视看起来正常”覆盖。
+5. **校验交付 PPTX 本身。** 对最终 `.pptx` 运行 `pptx-telemetry`；同时运行 Presentations finalizer、逐页渲染和人工目视检查。artifact-tool 遥测只证明 artifact-tool 版面；OOXML 遥测才证明交付文件，二者不得互相替代。
+
+artifact-tool 分支的过关线为：计划有效、plan-to-layout 映射完整、artifact 遥测 `pass`（或已签署的人工审查处置）、交付 PPTX 遥测通过、无文字溢出/越界/图像比例错误，并完成逐页人工验收。
 
 ## 阶段 1　paperworkflow：PDF → workflow.json
 
@@ -420,7 +440,12 @@ $NODE server/cli.mjs plan --file <rpa_input.json> \
 
 ---
 
-## 阶段 4　渲染 pptx + 交付物遥测校验（pptx-telemetry）
+## 阶段 4　渲染与交付物遥测校验（按已选分支执行）
+
+先在任务中声明 `renderer_branch: slidep | artifact-tool`。不得混用两条分支的“半套门禁”：
+
+- `slidep`：执行本节的 SlideDSL、tencent-pptx 与 `pptx-telemetry` 步骤。
+- `artifact-tool`：执行上文 artifact-tool 分支的 plan-to-layout、`artifact-telemetry`、Presentations finalizer 与 `pptx-telemetry` 步骤；本节所有 `.slide` 文件、`slidep` watcher 与 `normAutofit` 约束均不适用。
 
 > 下面裸 `node` 命令均指 `D:/Node24/node.exe`（RPA 必须 Node 24，见阶段 3 的
 > `NODE` 变量定义），在 RPA 目录 `C:/Users/Beibei/plugins/research-ppt-assistant`
@@ -490,13 +515,13 @@ node server/cli.mjs preflight     --file preflight-input.json
 > - `normalize_content` 额外输出 `coverage`（`orphan_must_keep_evidence` /
 >   `unused_citations`），用于发现"声明必须保留却无任何页引用"的证据。
 
-**4b. 渲染** —— 用 **tencent-pptx** skill（先读它的
+**4b. `slidep` 分支渲染** —— 用 **tencent-pptx** skill（先读它的
 `references/create-from-material.md`），以 `deck_plan.json` + `evidence.md`
 为材料生成 pptx。产物目录里会有 `.pptx` 和 `slides/*.slide`。
 论文里的图从 `images/` 按 evidence 的 figure 引用带进去 —— 兜底生成的
 slide_briefs 不会自动带图，要进图必须自己指定。
 
-**4c. 渲染后 shape 级校验** —— 用 **pptx-telemetry** skill（同仓库
+**4c. `slidep` 分支渲染后 shape 级校验** —— 用 **pptx-telemetry** skill（同仓库
 `F:/Workbuddy/Total-pipe/skills/pptx-telemetry/`，符号链接在
 `C:/Users/Beibei/.workbuddy/skills/pptx-telemetry`，完整契约/阈值/排错都在它自己的
 SKILL.md 里）。
@@ -549,8 +574,8 @@ node server/cli.mjs validate-rendered-deck    --file rendered-deck.json
 | `design_land.py brief` | `_design_brief.md`：每页槽位 bbox / 容量 / 已用字数 / **未覆盖空白带** / 图片 / 语汇货架。**没有"必须画什么"** |
 | `design_land.py check` | 表头八列 `元素 / 最小字号 / 小字 / 越界 / 溢出 / 裁图`；`FAIL` 有 5 种码：`FONT_TOO_SMALL` / `OUT_OF_CANVAS` / `TEXT_OVERFLOW` / 页脚页码缺失 / `IMAGE_ASPECT_MISMATCH`（附「应改成 WxH」的建议）；`IMAGE_UNRESOLVED` 只 WARN |
 
-健康基线：`status=valid` + `violations=[]` + `pipeline_status=plan_complete`。
-不达标说明上游有问题，往回查，别在阶段 3 里硬调。
+共同健康基线：`status=valid` + `violations=[]` + `pipeline_status=plan_complete`。
+随后按分支补齐下游基线：slidep 要有 `preflight_complete` 与交付物 OOXML QA；artifact-tool 要有完整 plan-to-layout 映射、artifact telemetry 处置结果和交付物 OOXML QA。任一门禁不达标都应回到相应阶段修复，不得在渲染阶段硬调或换用另一分支掩盖问题。
 
 ## 兜底：连接器还没被 Trust 时
 
@@ -657,9 +682,11 @@ RPA `assets/layout-library/layouts.json` 的 `version` 一致（当前都是 2.0
 | 3 | 同步 `DESIGN.md` | 「2.4 每页配色分配」「6. 母版组件清单」补到 N 页 | 新增页无配色分配约束，风格易飘 |
 | 4 | 清理中间文件 | `_v2.pptx` / `_rebuild.pptx` / `deck_plan_cm.json` / `~$*.pptx` | 目录里堆几百 KB 无用文件 |
 
-## 组件覆盖率门禁（收工前必跑，硬门禁）
+## 组件覆盖率门禁（收工前必跑，按分支执行）
 
-光靠自觉扫一遍没用——实测会漏。**收工前必须跑脚本**，有 FAIL 就不许交付：
+光靠自觉扫一遍没用——实测会漏。`slidep` 分支收工前必须跑下面的脚本；artifact-tool 分支则必须保存等价的 plan-to-layout 映射，并在 `artifact-telemetry` 和 `pptx-telemetry` 两个 QA 报告中没有未处置的 FAIL。不要拿 `.slide` 组件覆盖率审计去否决 artifact-tool 交付物，也不要拿 artifact-tool 的孪生遥测代替 slidep 交付物的 OOXML 审计。
+
+`slidep` 分支有 FAIL 就不许交付：
 
 ```bash
 python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_audit.py" \

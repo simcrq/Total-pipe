@@ -1,0 +1,29 @@
+{
+  "name": "total-pipe",
+  "version": "1.0.0+codex.20260917113321",
+  "description": "End-to-end research-paper to presentation workflow with evidence, layout, rendering, and PPTX telemetry stages.",
+  "author": {
+    "name": "Total-pipe"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Total-pipe",
+    "shortDescription": "Turn research papers into evidence-grounded PPTX decks.",
+    "longDescription": "Orchestrates PaperWorkflow, pwf2rpa, Research PPT Assistant, rendering, and delivery-PPTX telemetry through reusable Codex skills and a local MCP adapter.",
+    "developerName": "Total-pipe",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Analysis",
+      "Planning",
+      "Write"
+    ],
+    "brandColor": "#2563EB",
+    "defaultPrompt": [
+      "Turn this research paper into a presentation deck.",
+      "Run the Total-pipe workflow for this paper.",
+      "Audit this PPTX with delivery telemetry."
+    ]
+  }
+}
