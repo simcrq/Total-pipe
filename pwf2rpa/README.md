@@ -3,10 +3,22 @@
 Converts a PaperWorkflow v4 `workflow.json` into the content-model input that
 RPA's `normalize_content` and `create_deck_plan` consume.
 
-Standard library only, Python 3.10+, deterministic output.
+Standard library only, Python 3.10+, deterministic validation and conversion.
+
+The recommended path now inserts an evidence-grounded Story Planner before
+slide briefs. The Story itself must be produced by a high-capability subagent
+using a model explicitly selected by the user; pwf2rpa builds the prompt,
+validates provenance and evidence references, then maps the reasoning chain to
+RPA planning units.
 
 ```bash
-python3 pwf_to_rpa.py workflow.json --briefs briefs.json --out rpa_input.json
+python3 pwf_to_rpa.py workflow.json \
+  --make-story-prompt story_prompt.json \
+  --story-model <user-selected-model> \
+  --story-reasoning high \
+  --model-selected-by-user
+# Delegate story_prompt.json to that model as a subagent and save its JSON as story_plan.json.
+python3 pwf_to_rpa.py workflow.json --story story_plan.json --out rpa_input.json
 node server/cli.mjs normalize-content --file rpa_input.json
 node server/cli.mjs plan --file rpa_input.json --presentation-type group_meeting
 ```
@@ -17,12 +29,58 @@ RPA already understands PaperWorkflow: given `paperworkflow_v4`, its own
 `adaptWorkflow` derives every Source, Citation and Evidence record. Re-deriving
 them here would add nothing and drift the moment RPA changes.
 
-So the adapter passes the workflow through **untouched** and concentrates on
-the one thing RPA cannot infer — `slide_briefs`:
+So the adapter passes the workflow through **untouched**. Its recommended mode
+validates a compact Story and converts it into the one thing RPA cannot infer —
+`slide_briefs`:
 
 ```json
 { "paperworkflow_v4": { ...verbatim... }, "slide_briefs": [ ... ] }
 ```
+
+## Story Planning is a hard intermediate gate
+
+The full path is:
+
+```text
+PaperWorkflow Evidence
+  -> high-capability Story subagent
+  -> story_plan.json
+  -> pwf2rpa validation/mapping
+  -> slide_briefs
+  -> RPA Slide Planning
+```
+
+Before creating the Story prompt, the orchestrator must ask the user which
+currently available high-capability model to use. The main agent may not select
+silently or write the Story itself. The output records:
+
+```json
+{
+  "planner": {
+    "mode": "subagent",
+    "model": "<exact user choice>",
+    "reasoning_effort": "high",
+    "selected_by_user": true
+  },
+  "core_question": "...",
+  "main_message": "...",
+  "story": [
+    {"question": "...", "answer": "...", "evidence": ["EV0001"], "next": "..."}
+  ],
+  "ending": {"takeaway": "...", "limitation": "..."}
+}
+```
+
+Five to eight nodes are required. A node is a scientific reasoning step, not a
+Figure and not necessarily one final slide. `allow_auto_split` remains enabled
+for reasoning nodes so the downstream planner retains page-count authority.
+The full machine-readable contract is in `schemas/story-plan.schema.json`.
+
+The validator blocks when the model was not user-selected, execution was not a
+subagent, reasoning is below `high`, an Evidence id does not resolve, or `next`
+degenerates into a sequential transition such as “接下来作者介绍 Fig.4”. It also
+warns when a hedged source appears to have been rewritten as a certain causal
+claim; strict mode can promote that warning to failure.
 
 ## The four hard constraints
 
@@ -87,6 +145,7 @@ one (`crowded_pages`), which avoids false alarms.
 ### As a CLI
 
 ```bash
+python3 pwf_to_rpa.py workflow.json --story story_plan.json --out rpa_input.json
 python3 pwf_to_rpa.py workflow.json --briefs briefs.json --out rpa_input.json
 python3 pwf_to_rpa.py workflow.json --out rpa_input.json   # fallback deck
 python3 pwf_to_rpa.py --list-categories                    # the 40 legal ids
@@ -98,16 +157,17 @@ Exit codes: `0` ok · `2` blocking problem (nothing written) · `3` `--strict` a
 ### As a library
 
 ```python
-from pwf2rpa import Workflow, convert, write_output
+from pwf2rpa import Workflow, convert, load_story, write_output
 
 workflow = Workflow.from_path("workflow.json")
 workflow.validate()
-payload, warnings = convert(workflow, specs)
+payload, warnings = convert(workflow, story=load_story("story_plan.json"))
 write_output(payload, "rpa_input.json")
 ```
 
-### Without `--briefs`
+### Without `--story` or `--briefs`
 
+This is a compatibility fallback, not a compliant full Total-pipe run.
 Evidence is grouped by `query_ids` (PaperWorkflow's retrieval intents), each
 intent mapped to a fitting category, and claims compressed to fit the slots.
 Every evidence entry stays cited. The result plans cleanly — it is a starting
@@ -158,11 +218,14 @@ pwf2rpa/
   briefs.py           spec -> SLIDE_BRIEF, enforces the four rules
   fit.py              offline replay of RPA's two capacity gates
   fallback.py         deterministic briefs when none are supplied
+  story.py            Story prompt, provenance/evidence validation, brief mapping
   convert.py          payload assembly and deterministic writing
   capacity.py         generated: 320 layouts x capacity envelope
   refresh.py          regenerates capacity.py from an RPA checkout
   errors.py           Problem records with severity
-tests/test_adapter.py 55 tests
+schemas/story-plan.schema.json  Story Planner interchange contract
+tests/test_adapter.py           bridge regression tests
+tests/test_story.py             Story/subagent hard-gate tests
 ```
 
 ## Tests

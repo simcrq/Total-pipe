@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 from .briefs import build_briefs
 from .errors import BriefError, Problem
 from .fallback import fallback_specs
+from .story import story_to_specs
 from .workflow import Workflow
 
 __all__ = ["convert", "write_output", "load_specs"]
@@ -18,6 +19,7 @@ def convert(
     workflow: Workflow,
     specs: Sequence[Mapping[str, Any]] | None = None,
     *,
+    story: Any | None = None,
     strict_fit: bool = True,
 ) -> tuple[dict[str, Any], list[Problem]]:
     """Build the two-key payload RPA expects.
@@ -28,8 +30,10 @@ def convert(
 
     Args:
         workflow: A validated workflow.
-        specs: Slide-brief specs; when ``None`` a deterministic fallback deck
-            is derived from the evidence registry's query intents.
+        specs: Slide-brief specs; mutually exclusive with ``story``. When both
+            are ``None`` a deterministic legacy fallback deck is derived.
+        story: Validated Story Planner JSON produced by a user-selected,
+            high-reasoning subagent. It is converted into semantic briefs.
         strict_fit: Check each page against its category's layout capacity.
 
     Returns:
@@ -40,13 +44,22 @@ def convert(
         BriefError: if the specs breach the slide-brief contract in a way RPA
             would reject.
     """
-    resolved = fallback_specs(workflow) if specs is None else specs
+    if specs is not None and story is not None:
+        raise BriefError(
+            [Problem("STORY_AND_BRIEFS_CONFLICT", "$", "provide either story or briefs, not both.")],
+            summary="Ambiguous planning input",
+        )
+    story_warnings: list[Problem] = []
+    if story is not None:
+        resolved, story_warnings = story_to_specs(story, workflow)
+    else:
+        resolved = fallback_specs(workflow) if specs is None else specs
     briefs, warnings = build_briefs(resolved, workflow, strict_fit=strict_fit)
     payload = {
         "paperworkflow_v4": workflow.document,
         "slide_briefs": briefs,
     }
-    return payload, warnings
+    return payload, story_warnings + warnings
 
 
 def load_specs(path: str | Path) -> list[Mapping[str, Any]]:

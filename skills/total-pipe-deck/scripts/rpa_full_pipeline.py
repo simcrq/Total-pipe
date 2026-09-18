@@ -12,6 +12,7 @@ Agent 得先猜；猜不中就绕过。
 
 本脚本把阶段 3 固化成一条命令，输入全部自动装配，并且 fail-fast：
 
+    S0  Story provenance      → 用户选模 + subagent + reasoning>=high
     S1  normalize-content     → status 必须 valid
     S2  plan                  → pipeline_status 必须 plan_complete
     S3  validate-deck         → status 必须 valid
@@ -262,6 +263,37 @@ def collect_assets(args, plan):
     return clean, missing
 
 
+def validate_story_provenance(payload):
+    """Require user-selected high-reasoning subagent provenance on Story briefs."""
+    briefs = payload.get("slide_briefs") if isinstance(payload, dict) else None
+    if not isinstance(briefs, list):
+        return False, "rpa_input.json 缺少 slide_briefs"
+    reasoning = [b for b in briefs if isinstance(b, dict) and b.get("narrative_job") == "story_reasoning"]
+    if not reasoning:
+        return False, "没有 narrative_job=story_reasoning 的 Story 节点"
+
+    allowed_efforts = {"high", "xhigh", "max", "ultra"}
+    signatures = set()
+    for index, brief in enumerate(reasoning, start=1):
+        metadata = brief.get("metadata") if isinstance(brief.get("metadata"), dict) else {}
+        planner = metadata.get("story_planner") if isinstance(metadata.get("story_planner"), dict) else {}
+        mode = planner.get("mode")
+        model = planner.get("model")
+        effort = planner.get("reasoning_effort")
+        selected = planner.get("selected_by_user") is True
+        if mode != "subagent" or not isinstance(model, str) or not model.strip() \
+                or effort not in allowed_efforts or not selected:
+            return False, (
+                "Story 节点 %s 的 provenance 不合规：要求 user-selected model + "
+                "mode=subagent + reasoning>=high" % index
+            )
+        signatures.add((model.strip(), effort))
+    if len(signatures) != 1:
+        return False, "Story 节点记录了不一致的模型或推理等级"
+    model, effort = next(iter(signatures))
+    return True, "%s 个节点 · model=%s · reasoning=%s" % (len(reasoning), model, effort)
+
+
 # ---------------------------------------------------------------------------- 主流程
 
 def main():
@@ -301,6 +333,8 @@ def main():
     ap.add_argument("--allow-visual-fail", action="store_true",
                     help="S5 几何不兼容时仍继续（默认会中断；只在你确认手写 SlideDSL "
                          "不按 RPA 槽位摆位时才用）")
+    ap.add_argument("--allow-legacy-no-story", action="store_true",
+                    help="兼容旧输入：跳过 Story subagent provenance 门禁；完整 Total-pipe 禁用")
     args = ap.parse_args()
 
     for p in (args.rpa_input,):
@@ -342,6 +376,23 @@ def main():
     print("  out_dir   : %s" % args.out_dir)
     print("  产物目录  : %s" % work)
     print("=" * 78)
+
+    # --------------------------------------------------------------- S0
+    try:
+        with open(args.rpa_input, encoding="utf-8") as stream:
+            rpa_payload = json.load(stream)
+    except Exception as error:
+        record("S0", "Story provenance", "FAIL", "无法读取 rpa_input.json: %s" % error)
+        return finish(work, steps, failed, warned, args)
+    if args.allow_legacy_no_story:
+        record("S0", "Story provenance", "SKIP", "--allow-legacy-no-story（仅兼容旧输入）")
+    else:
+        story_ok, story_note = validate_story_provenance(rpa_payload)
+        record("S0", "Story provenance", "PASS" if story_ok else "FAIL", story_note)
+        if not story_ok:
+            print("\n怎么修：先询问用户选择高能力模型，用 pwf2rpa_story_prompt 生成提示，"
+                  "把任务委派给该模型 subagent，再以 story_path 重跑 pwf2rpa_convert。")
+            return finish(work, steps, failed, warned, args)
 
     # ---------------------------------------------------------------- S1
     cm_path = os.path.join(args.out_dir, "content_model.json")
@@ -486,10 +537,7 @@ def main():
     vfit_skip_pages = []
 
     # 预读 rpa_input 的 briefs，供 visual_type / text_chars 使用
-    try:
-        BRIEFS = json.load(open(args.rpa_input, encoding="utf-8"))["slide_briefs"]
-    except Exception:
-        BRIEFS = []
+    BRIEFS = rpa_payload.get("slide_briefs", [])
 
     def brief_info(slide_idx):
         try:

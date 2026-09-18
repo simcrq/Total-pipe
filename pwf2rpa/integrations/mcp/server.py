@@ -29,16 +29,18 @@ from pwf2rpa import (  # noqa: E402
     CATEGORIES,
     LAYOUT_LIBRARY_VERSION,
     Workflow,
+    build_story_prompt,
     build_briefs,
     convert,
     fallback_specs,
     load_specs,
+    load_story,
     write_output,
 )
 from pwf2rpa.errors import AdapterError, Problem  # noqa: E402
 
 SERVER_NAME = "pwf2rpa"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -46,14 +48,19 @@ DEFAULT_TIMEOUT = float(os.environ.get("PWF2RPA_TOOL_TIMEOUT", "120"))
 
 INSTRUCTIONS = (
     "pwf2rpa converts a PaperWorkflow v4 workflow.json into the input RPA's "
-    "normalize_content and create_deck_plan consume. Call pwf2rpa_check first: it "
+    "normalize_content and create_deck_plan consume. For the full Total-pipe path, "
+    "first ask the user to choose a high-capability model, delegate Story Planning "
+    "to that model as a subagent, and save its evidence-bound output. Use "
+    "pwf2rpa_story_prompt to build the prompt package; it refuses calls that do not "
+    "record explicit user selection and high-or-stronger reasoning. Then call pwf2rpa_check: it "
     "validates and replays RPA's layout-capacity gates without writing anything, so "
     "you can fix warnings before committing to a file. Then call pwf2rpa_convert to "
     "write rpa_input.json. Use pwf2rpa_list_categories whenever you need the 40 legal "
     "category_hint ids -- a free-form category label is not an error, RPA silently "
     "relaxes to a whole-library search and picks a mismatched layout. In the full "
-    "pipeline this is the middle stage: paperworkflow produces workflow.json, pwf2rpa "
-    "adds slide_briefs, research_ppt plans and renders the deck."
+    "pipeline this is the middle stage: paperworkflow produces workflow.json, the "
+    "user-selected Story subagent produces story_plan.json, pwf2rpa maps it to "
+    "slide_briefs, and research_ppt plans and renders the deck."
 )
 
 
@@ -129,22 +136,39 @@ def _summarise_slides(briefs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _resolve_specs(workflow: Workflow, briefs_path: str | None):
-    return load_specs(briefs_path) if briefs_path else fallback_specs(workflow)
+def _resolve_input(workflow: Workflow, briefs_path: str | None, story_path: str | None):
+    if briefs_path and story_path:
+        raise ValueError("briefs_path and story_path are mutually exclusive")
+    if story_path:
+        return None, load_story(story_path), "story"
+    if briefs_path:
+        return load_specs(briefs_path), None, "briefs"
+    return fallback_specs(workflow), None, "legacy_fallback"
 
 
-def _analyse(workflow_path: str, briefs_path: str | None, strict_fit: bool):
+def _analyse(
+    workflow_path: str,
+    briefs_path: str | None,
+    story_path: str | None,
+    strict_fit: bool,
+):
     """Shared body: validate, build briefs, return payload plus diagnostics."""
     workflow = Workflow.from_path(workflow_path)
     workflow.validate()
-    specs = _resolve_specs(workflow, briefs_path)
-    payload, warnings = convert(workflow, specs, strict_fit=strict_fit)
-    return payload, warnings
+    specs, story, input_mode = _resolve_input(workflow, briefs_path, story_path)
+    payload, warnings = convert(workflow, specs, story=story, strict_fit=strict_fit)
+    return payload, warnings, input_mode
 
 
-def _report(payload: dict[str, Any], warnings: list[Problem], output_path: str | None) -> dict:
+def _report(
+    payload: dict[str, Any],
+    warnings: list[Problem],
+    output_path: str | None,
+    input_mode: str,
+) -> dict:
     return {
         "output_path": output_path,
+        "input_mode": input_mode,
         "slide_count": len(payload["slide_briefs"]),
         "slides": _summarise_slides(payload["slide_briefs"]),
         "warning_count": len(warnings),
@@ -159,33 +183,46 @@ def _default_out(workflow_path: str) -> Path:
 
 def _tool_check(arguments: dict[str, Any]) -> dict[str, Any]:
     workflow_path = arguments["workflow_path"]
-    payload, warnings = _analyse(
+    payload, warnings, input_mode = _analyse(
         workflow_path,
         arguments.get("briefs_path"),
+        arguments.get("story_path"),
         strict_fit=not arguments.get("no_strict_fit", False),
     )
-    return _report(payload, warnings, None)
+    return _report(payload, warnings, None, input_mode)
 
 
 def _tool_convert(arguments: dict[str, Any]) -> dict[str, Any]:
     workflow_path = arguments["workflow_path"]
     out_path = arguments.get("out_path")
-    payload, warnings = _analyse(
+    payload, warnings, input_mode = _analyse(
         workflow_path,
         arguments.get("briefs_path"),
+        arguments.get("story_path"),
         strict_fit=not arguments.get("no_strict_fit", False),
     )
     if warnings and arguments.get("strict", False):
-        report = _report(payload, warnings, None)
+        report = _report(payload, warnings, None, input_mode)
         report["written"] = False
         report["reason"] = "strict mode: %d warning(s) treated as failure, nothing written" % len(warnings)
         return report
 
     destination = Path(out_path) if out_path else _default_out(workflow_path)
     write_output(payload, destination)
-    report = _report(payload, warnings, str(destination))
+    report = _report(payload, warnings, str(destination), input_mode)
     report["written"] = True
     return report
+
+
+def _tool_story_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
+    workflow = Workflow.from_path(arguments["workflow_path"])
+    workflow.validate()
+    return build_story_prompt(
+        workflow,
+        model=arguments.get("model", ""),
+        reasoning_effort=arguments.get("reasoning_effort", "high"),
+        selected_by_user=arguments.get("selected_by_user") is True,
+    )
 
 
 def _tool_list_categories(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -227,6 +264,44 @@ def _tool_refresh_capacity(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 TOOLS: dict[str, dict[str, Any]] = {
+    "pwf2rpa_story_prompt": {
+        "description": (
+            "Build the evidence-bound prompt package for the required Story Planner "
+            "subagent. Before calling, ask the user which currently available "
+            "high-capability model to use. The tool blocks unless selected_by_user is "
+            "true, a model is named, and reasoning_effort is high or stronger. The "
+            "returned package must be sent to that subagent; the main agent must not "
+            "write the Story output itself."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["workflow_path", "model", "selected_by_user"],
+            "properties": {
+                "workflow_path": {
+                    "type": "string",
+                    "description": "Path to a validated PaperWorkflow v4 workflow.json.",
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact high-capability model explicitly chosen by the user.",
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["high", "xhigh", "max", "ultra"],
+                    "default": "high",
+                },
+                "selected_by_user": {
+                    "type": "boolean",
+                    "const": True,
+                    "description": "Must be true only after the user explicitly chose the model.",
+                },
+            },
+        },
+        "handler": _tool_story_prompt,
+        "timeout": DEFAULT_TIMEOUT,
+    },
     "pwf2rpa_check": {
         "description": (
             "Validate a PaperWorkflow v4 workflow.json and replay RPA's layout-capacity "
@@ -246,7 +321,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "briefs_path": {
                     "type": "string",
-                    "description": "Optional slide-brief spec JSON (bare array or an object with slide_briefs). Omit to derive a deterministic fallback deck from the evidence registry's query intents.",
+                    "description": "Optional legacy slide-brief spec JSON. Mutually exclusive with story_path.",
+                },
+                "story_path": {
+                    "type": "string",
+                    "description": "Recommended Story Planner JSON from the user-selected high-capability subagent.",
                 },
                 "no_strict_fit": {
                     "type": "boolean",
@@ -277,7 +356,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "briefs_path": {
                     "type": "string",
-                    "description": "Optional slide-brief spec JSON. Omit to derive a deterministic fallback deck.",
+                    "description": "Optional legacy slide-brief spec JSON. Mutually exclusive with story_path.",
+                },
+                "story_path": {
+                    "type": "string",
+                    "description": "Recommended Story Planner JSON from the user-selected high-capability subagent.",
                 },
                 "out_path": {
                     "type": "string",

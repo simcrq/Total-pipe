@@ -40,7 +40,7 @@ SPEC_FIELDS = frozenset(
         "experiment_groups", "data_series", "content_roles", "image_count",
         "text_chars", "title_chars", "table_count", "chart_count",
         "process_step_count", "duration_weight", "viewing_mode",
-        "density_preference", "metadata",
+        "density_preference", "allow_auto_split", "metadata",
     }
 )
 
@@ -324,6 +324,8 @@ def _build_one(
         text = _text(spec.get(field))
         if text:
             brief[field] = text
+    if "allow_auto_split" in spec:
+        brief["allow_auto_split"] = bool(spec["allow_auto_split"])
     if isinstance(spec.get("metadata"), Mapping):
         brief["metadata"] = dict(spec["metadata"])
 

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Literal, NamedTuple
 
-__all__ = ["AdapterError", "Problem", "Severity", "WorkflowError", "BriefError"]
+__all__ = [
+    "AdapterError",
+    "Problem",
+    "Severity",
+    "WorkflowError",
+    "BriefError",
+    "StoryError",
+]
 
 Severity = Literal["error", "warning"]
 
@@ -107,3 +114,7 @@ class WorkflowError(AdapterError):
 
 class BriefError(AdapterError):
     """The slide briefs do not satisfy the RPA slide-brief contract."""
+
+
+class StoryError(AdapterError):
+    """The Story Planner output is unusable or lacks required provenance."""

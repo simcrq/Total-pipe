@@ -12,6 +12,7 @@ from . import __version__
 from .capacity import CATEGORIES, LAYOUT_LIBRARY_VERSION
 from .convert import convert, load_specs, write_output
 from .errors import AdapterError
+from .story import HIGH_REASONING_EFFORTS, build_story_prompt, load_story
 from .workflow import Workflow
 
 __all__ = ["main", "build_parser"]
@@ -22,8 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pwf_to_rpa",
         description="Convert a PaperWorkflow v4 workflow.json into Research PPT Assistant "
                     "content-model input.",
-        epilog="Without --briefs a deterministic fallback deck is derived from the "
-               "evidence registry's query intents.",
+        epilog="Use --story for the evidence-grounded path. Without --story or "
+               "--briefs, a deterministic legacy fallback is used.",
     )
     parser.add_argument("workflow", nargs="?", help="path to workflow.json (schema_version 4)")
     parser.add_argument(
@@ -32,7 +33,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild the bundled layout capacity table from an RPA checkout and exit "
              "(requires node; only needed when RPA's layout library changes)",
     )
-    parser.add_argument("--briefs", metavar="PATH", help="slide-brief spec array (JSON)")
+    planning = parser.add_mutually_exclusive_group()
+    planning.add_argument("--briefs", metavar="PATH", help="slide-brief spec array (JSON)")
+    planning.add_argument(
+        "--story",
+        metavar="PATH",
+        help="Story Planner JSON produced by a user-selected high-reasoning subagent",
+    )
+    parser.add_argument(
+        "--make-story-prompt",
+        metavar="PATH",
+        help="write a prompt package for the selected Story subagent and exit",
+    )
+    parser.add_argument("--story-model", metavar="MODEL", help="exact model explicitly selected by the user")
+    parser.add_argument(
+        "--story-reasoning",
+        choices=sorted(HIGH_REASONING_EFFORTS),
+        default="high",
+        help="reasoning effort for the Story subagent (default: high)",
+    )
+    parser.add_argument(
+        "--model-selected-by-user",
+        action="store_true",
+        help="confirm that the user explicitly selected --story-model",
+    )
     parser.add_argument("--out", metavar="PATH", help="output path (default: rpa_input.json next to the workflow)")
     parser.add_argument(
         "--no-strict-fit",
@@ -100,12 +124,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _print_categories()
     if not args.workflow:
         parser.error("workflow path is required (or use --list-categories)")
+    if args.make_story_prompt and (args.story or args.briefs):
+        parser.error("--make-story-prompt cannot be combined with --story or --briefs")
 
     try:
         workflow = Workflow.from_path(args.workflow)
         workflow.validate()
+        if args.make_story_prompt:
+            package = build_story_prompt(
+                workflow,
+                model=args.story_model or "",
+                reasoning_effort=args.story_reasoning,
+                selected_by_user=args.model_selected_by_user,
+            )
+            write_output(package, args.make_story_prompt)
+            print(f"wrote {args.make_story_prompt}")
+            return 0
         specs = load_specs(args.briefs) if args.briefs else None
-        payload, warnings = convert(workflow, specs, strict_fit=not args.no_strict_fit)
+        story = load_story(args.story) if args.story else None
+        payload, warnings = convert(
+            workflow,
+            specs,
+            story=story,
+            strict_fit=not args.no_strict_fit,
+        )
     except AdapterError as error:
         print(str(error), file=sys.stderr)
         return 2

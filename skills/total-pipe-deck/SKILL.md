@@ -1,16 +1,16 @@
 ---
 name: total-pipe-deck
-description: 从论文 PDF 到研究汇报 PPT 的三段式流水线（paperworkflow → pwf2rpa → research_ppt）。当用户要"把这篇论文做成汇报/组会 PPT""从 PDF 生成 slides""跑通 Total-pipe"时使用。
+description: 从论文 PDF 到研究汇报 PPT 的证据—故事—页面流水线（paperworkflow → 高能力 Story subagent → pwf2rpa → research_ppt）。当用户要"把这篇论文做成汇报/组会 PPT""从 PDF 生成 slides""跑通 Total-pipe"时使用。
 ---
 
 # Total-pipe：论文 → 研究汇报 PPT
 
-三段流水线，各段是一个 MCP 连接器。**本文件就是调用契约，不要再去读连接器源码。**
+Evidence、Story、Slide Plan、Render 四层流水线。**本文件就是调用契约，不要再去读连接器源码。**
 
 ```
-paperworkflow          pwf2rpa            research_ppt          render（分支）          telemetry + QA
-PDF → 证据注册表  →  加 slide_briefs  →  选版面 / 规划    →    deck.pptx     →    OOXML 遥测 + QA
-workflow.json          rpa_input.json       deck_plan.json                                 sidecar / QA 报告
+paperworkflow       Story Planner subagent       pwf2rpa          research_ppt       render（分支）       telemetry + QA
+PDF → 证据注册表  →  科研叙事重构       →    叙事映射    →    选版面 / 规划  →   deck.pptx   →   OOXML 遥测 + QA
+workflow.json          story_plan.json           rpa_input.json     deck_plan.json                          sidecar / QA 报告
 ```
 
 渲染只能在 `deck_plan.json` 已完成后选择一个下游分支：
@@ -25,16 +25,65 @@ workflow.json          rpa_input.json       deck_plan.json                      
 | 段 | 连接器 | 位置 |
 |---|---|---|
 | 1 | `paperworkflow` | `F:/Workbuddy/Total-pipe/paperworkflow` |
+| 1.5 | Story Planner | 用户明确选择的高能力模型 subagent（不是主代理自行总结） |
 | 2 | `pwf2rpa` | `F:/Workbuddy/pwf2rpa` |
 | 3 | `research_ppt` | `C:/Users/Beibei/plugins/research-ppt-assistant`（symlink，真身 `F:/Project/PPTcreator/...`）|
 
-版本：RPA **0.6.1**，版面库 **2.0.0**（320 版面 / 40 分类），pwf2rpa **1.0.0**。
+版本：RPA **0.6.1**，版面库 **2.0.0**（320 版面 / 40 分类），pwf2rpa **1.1.0**。
 
 > RPA 必须用 **Node.js 24**（固定 `D:/Node24/node.exe`，v24.20.0 Krypton LTS）。
 > 不要硬编码 WorkBuddy managed node 的 `versions/<ver>/node.exe` 路径——升级会漂移。
 
 > 三个连接器都必须在连接器管理页点过 **Trust** 才有工具可用。如果某个工具
 > 不存在，先让用户去 Trust，不要去改代码。
+
+### ⚠ Story Planner 是硬门禁：必须先问用户选模型，再调用 subagent
+
+`paperworkflow` 产出 `workflow.json` 后，**不要直接调用 `pwf2rpa_check/convert`**。
+必须依次完成：
+
+1. 从当前运行环境可用模型中筛出高能力候选，向用户明确提问“Story Planner 用哪个模型？”；给 2–3 个候选即可，可以标推荐项，但**不得替用户默认选择**。
+2. 用户选择后调用 `pwf2rpa_story_prompt`：
+
+```text
+pwf2rpa_story_prompt
+  workflow_path
+  model                 # 用户刚刚明确选择的精确模型名
+  reasoning_effort      # high / xhigh / max / ultra；不得低于 high
+  selected_by_user=true
+```
+
+3. 把工具返回的完整 prompt package 原样交给该模型的 **subagent**。不得由主代理代写，不得用新建普通任务冒充 subagent，也不得静默改用更便宜模型。
+4. 保存 subagent 的纯 JSON 输出为 `story_plan.json`。若输出不合规，错误和原始证据应回送同一个 subagent 修订；主代理只负责编排与确定性校验。
+5. 若当前环境没有 subagent 能力、用户尚未选模型或所选模型不可用，停在此阶段如实报告。完整 Total-pipe 不得退回 Figure 顺序或确定性 fallback 冒充成功。
+
+`story_plan.json` 的最小契约：
+
+```json
+{
+  "planner": {
+    "mode": "subagent",
+    "model": "<用户选择>",
+    "reasoning_effort": "high",
+    "selected_by_user": true
+  },
+  "core_question": "论文真正要解决的核心问题",
+  "main_message": "整场汇报希望听众记住的一句话",
+  "story": [
+    {
+      "question": "当前科学问题",
+      "answer": "Evidence 支撑的回答",
+      "evidence": ["EV0001", "EV0002"],
+      "next": "当前证据留下、使下一步实验成为必要的疑问"
+    }
+  ],
+  "ending": {"takeaway": "最终结论", "limitation": "边界或未解决问题"}
+}
+```
+
+必须有 5–8 个节点。节点是科研推理步骤，不是 Figure，也不等同于最终页数；下游保留 `allow_auto_split`。Story 只决定“哪些证据最重要、为什么按这个顺序讲”，不决定布局、配色、裁图、页数或完整实验参数。
+
+硬规则：Evidence id 必须真实存在；不得把共现改成因果；不得提高 may/likely/suggest/possibly 的确定性；`next` 必须是疑问、缺口、待排除解释或待验证机制，不能是“然后 / 此外 / 接下来 Fig.4”。相邻节点应能用“因此 / 但是 / 为了验证 / 为了排除 / 如果该解释成立”连接。
 
 ---
 
@@ -58,7 +107,7 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/rpa_full_pipel
     --assets-from-slides        # 或 --assets-map 映射.json
 ```
 
-它按 S1→S8 串行，任一步 FAIL 立即中断（退出码 1），每步产物落在 `<out-dir>/_rpa/`，
+它按 S0→S8 串行，任一步 FAIL 立即中断（退出码 1），每步产物落在 `<out-dir>/_rpa/`，
 并生成 `_pipeline_report.md`。常用开关：
 
 | 参数 | 用途 |
@@ -72,11 +121,13 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/rpa_full_pipel
 | `--min-font 10.5` | S8 字号下限，接管版面库的 18pt 约束 |
 | `--density 22 44` | S8 每页元素数软目标区间 |
 | `--strict` | warning 也当失败 |
+| `--allow-legacy-no-story` | 仅兼容旧输入，跳过 Story provenance；完整 Total-pipe 禁用 |
 
-S1–S8 分别是（**以 `rpa_full_pipeline.py` 的实现编号为准**，别按语感排）：
+S0–S8 分别是（**以 `rpa_full_pipeline.py` 的实现编号为准**，别按语感排）：
 
 | | 步骤 | 说明 |
 | :-- | :-- | :-- |
+| S0 | Story provenance | 必须证明用户明确选模、由 subagent 执行、reasoning ≥ high；否则阻断 |
 | S1 | `normalize-content` | → `content_model.json` |
 | S2 | `plan` | → `deck_plan.json`，`pipeline_status` 必须 `plan_complete` |
 | S3 | `validate-deck` | 必须 `valid` |
@@ -311,7 +362,8 @@ paperworkflow_process_pdf       pdf_path（必填）      # 只 OCR，不建证�
 ```
 pwf2rpa_check
   workflow_path    # 必填
-  briefs_path      # 可选，不传则用证据的 query 意图自动兜底生成
+  story_path       # 完整 Total-pipe 必填：阶段 1.5 的 story_plan.json
+  briefs_path      # 仅旧流程兼容；与 story_path 互斥
   no_strict_fit    # 默认 false
 ```
 返回 `slide_count` / `slides[]` / `warning_count` / `warnings[]`。
@@ -322,11 +374,19 @@ pwf2rpa_check
 pwf2rpa_convert
   workflow_path    # 必填
   out_path         # 默认写到 workflow 同级的 rpa_input.json
-  briefs_path / strict / no_strict_fit
+  story_path       # 完整 Total-pipe 必填
+  briefs_path / strict / no_strict_fit  # briefs_path 仅旧流程兼容
 ```
 
-`paperworkflow_v4` 原样透传，这一段只补 RPA 推不出来的 `slide_briefs`。
+`paperworkflow_v4` 原样透传；Story 节点经验证后映射为 RPA 推不出来的
+`slide_briefs`。每个 brief 的 `metadata` 保留 `story_question` / `story_answer` /
+`story_next` / `story_node_index` 与 subagent provenance，供页面规划、演讲过渡和审计使用。
+节点不等于页面，reasoning brief 默认 `allow_auto_split=true`。
 输出逐字节稳定，同输入必同输出。
+
+如果 `story_path` 与 `briefs_path` 都不传，pwf2rpa 仍会生成确定性 fallback，目的是
+兼容旧调用和测试管线；**它不是完整 Total-pipe 的合规 Story 阶段**，不得在组会/PPT
+任务中把该 fallback 当作 Story Planner 成功。
 
 ### 四条硬约束（README 说每条都真实咬过人）
 
@@ -705,7 +765,7 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_
 ### 各段容易漏用的能力（跑完门禁后对照看）
 
 - **paperworkflow**：只调 `literature_workflow` 就够出证据，但 `process_pdf` / `outline` / `search_evidence` / `prompt_builder` 常整段未用。若 `synthesis_readiness` 卡在 review 门，应回到这里补 `queries` 而不是硬过。
-- **pwf2rpa**：默认兜底 briefs 常质量不佳（占位标题），人工重写后它就退化成**纯格式校验器**。重写 briefs 是合理的，但要清楚此时 `convert` 的自动映射价值≈0。
+- **Story / pwf2rpa**：完整流程必须先跑用户选定的高能力 subagent，再用 `story_path` 进入 pwf2rpa。默认兜底 briefs 只用于兼容/冒烟测试；直接手写 briefs 会绕过 Story 叙事门禁，不能标记为完整 Total-pipe。
 - **research_ppt**：有 20 个 MCP 工具 + 20 个 CLI 命令，通常只用 `normalize-content` / `plan` / `validate-deck` 三个。版面库 320 个版面、以及 `preflight` / `figure-placement` / `group-fit-preflight` / `visual-fit-preflight` / `visual-quality` 这一串**渲染前预检**经常被跳过——而它们恰好是防碰撞的第一道闸。
 - **tencent-pptx**：组件有 14 个（box/text/image/**table**/chart/diagram/svg/faicon/math/codeblock/qrcode/hyperlink/animation/slide），实际常只用 4 个。表格类页面**务必用 `component-table.md` 的原生 Table**，不要用 Box+Text 手搭——手搭会被 QA 判 `EXCESSIVE_WHITESPACE`，且对齐难控。
 
