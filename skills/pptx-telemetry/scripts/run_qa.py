@@ -72,6 +72,16 @@ def declared_content_from_plan(plan_slide):
     return " ".join(parts)
 
 
+def read_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sidecars", required=True)
@@ -90,10 +100,12 @@ def main():
         sys.exit(f"no sidecars in {args.sidecars}")
 
     plan_slides = {}
-    if args.plan and os.path.exists(args.plan):
-        plan = json.load(open(args.plan, encoding="utf-8"))
-        for s in plan.get("slides", []):
-            plan_slides[s.get("index")] = s
+    if args.plan:
+        plan = read_json(args.plan)
+        slides = plan.get("slides", [])
+        offset = 1 if any(s.get("index") == 0 for s in slides) else 0
+        for s in slides:
+            plan_slides[int(s["index"]) + offset] = s
 
     telemetries = []
     summary = {"slides": [], "deck": None}
@@ -102,7 +114,7 @@ def main():
         tel_path = os.path.join(args.work, f"telemetry-{tag}.json")
         run(args.node, [cli, "assemble-render-telemetry", "--file", sc], tel_path)
         try:
-            tel = json.load(open(tel_path, encoding="utf-8"))
+            tel = read_json(tel_path)
         except Exception:
             print(f"[{tag}] assemble: ERROR (non-JSON output) -> {tel_path}")
             summary["slides"].append({"slide": tag, "assemble": "error"})
@@ -118,30 +130,41 @@ def main():
             # Feed the canonical telemetry as `telemetry` (not a bare slide object),
             # so validate-rendered-deck uses the real elements instead of the legacy
             # adapter (which only reads `text_elements` and would silently drop them).
-            entry = {"telemetry": ct, "quality_profile_id": "artifact-tool"}
+            entry = {"telemetry": ct, "quality_profile_id": "artifact-tool",
+                     "enforce_typography": True, "viewing_mode": args.viewing_mode}
             slide = ct.get("slide") or {}
             if slide.get("category"):
                 entry["category"] = slide["category"]
             if slide.get("layout_id"):
                 entry["layout_id"] = slide["layout_id"]
-            if plan_slides:
+            if args.plan:
                 try:
                     idx = int(tag)
                 except (TypeError, ValueError):
                     idx = None
+                if idx not in plan_slides:
+                    raise ValueError(f"No plan slide index matched sidecar: {sc}")
                 body = declared_content_from_plan(plan_slides.get(idx))
+                planned = plan_slides.get(idx) or {}
+                intent = (planned.get("design_ir") or {}).get("presentation_intent")
+                if intent is not None:
+                    entry["presentation_intent"] = intent
                 if body:
                     entry["declared_body"] = body
             telemetries.append(entry)
             vq_in = os.path.join(args.work, f"vq-input-{tag}.json")
-            json.dump({"telemetry": tel["canonical_telemetry"], "profile_id": "artifact-tool"},
-                      open(vq_in, "w", encoding="utf-8"), ensure_ascii=False)
+            write_json(vq_in, {"telemetry": tel["canonical_telemetry"], "profile_id": "artifact-tool",
+                       **({"presentation_intent": entry["presentation_intent"]} if "presentation_intent" in entry else {}),
+                       "context": {"viewing_mode": args.viewing_mode, "enforce_typography": True}})
             vq_path = os.path.join(args.work, f"vq-{tag}.json")
             run(args.node, [cli, "visual-quality", "--file", vq_in], vq_path)
             try:
-                vq = json.load(open(vq_path, encoding="utf-8"))
+                vq = read_json(vq_path)
                 vs = [(v.get("severity"), v.get("code")) for v in (vq.get("violations") or [])]
                 row["visual_quality"] = vq.get("status")
+                row["typography"] = vq.get("checks", {}).get("projector_typography", {}).get("status", "not_evaluable")
+                if entry.get("presentation_intent", {}).get("required_on_screen"):
+                    row["presentation_intent"] = vq.get("checks", {}).get("presentation_intent", {}).get("status", "not_evaluable")
                 row["violations"] = vs
                 print(f"[{tag}] visual-quality: {vq.get('status')} {vs}")
             except Exception:
@@ -174,11 +197,10 @@ def main():
 
     deck_path = args.deck or os.path.join(args.work, "rendered-deck.json")
     deck_in = os.path.join(args.work, "deck-input.json")
-    json.dump({"slides": telemetries, "viewing_mode": args.viewing_mode},
-              open(deck_in, "w", encoding="utf-8"), ensure_ascii=False)
+    write_json(deck_in, {"slides": telemetries, "viewing_mode": args.viewing_mode})
     run(args.node, [cli, "validate-rendered-deck", "--file", deck_in], deck_path)
     try:
-        deck = json.load(open(deck_path, encoding="utf-8"))
+        deck = read_json(deck_path)
         summary["deck"] = {k: deck.get(k) for k in ("pipeline_status", "status", "invalid_slides",
                                                     "warning_slides", "readability_status",
                                                     "visual_quality_status", "text_sparsity_invalid_slides",
@@ -214,10 +236,20 @@ def main():
         ensure_ascii=False,
     ))
 
-    json.dump(summary, open(os.path.join(args.work, "summary.json"), "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+    failed = any(row.get("assemble") not in ("pass", "manual_review_required")
+                 or row.get("visual_quality") not in ("pass", "warning")
+                 or row.get("typography") not in ("pass", "warning")
+                 or row.get("presentation_intent", "pass") != "pass"
+                 or "error" in row.get("collision_check", {})
+                 for row in summary["slides"])
+    failed = failed or summary["deck"].get("status") not in ("valid", "warning")
+    summary["release_status"] = "blocked" if failed else "review_required" if any(
+        row.get("assemble") == "manual_review_required" or row.get("visual_quality") == "warning"
+        for row in summary["slides"]) else "pass"
+    write_json(os.path.join(args.work, "summary.json"), summary)
     print("summary ->", os.path.join(args.work, "summary.json"))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

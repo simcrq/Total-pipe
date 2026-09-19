@@ -118,8 +118,8 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/rpa_full_pipel
 | `--skeleton-force` | 骨架目录已有 .slide 时强制覆盖 |
 | `--allow-visual-fail` | S5 几何不兼容仍继续（仅当手写 DSL 不按 RPA 槽位摆位时用） |
 | `--no-design` | 跳过 S8（不推荐；跳过就等于回到"空旷"的旧行为） |
-| `--min-font 10.5` | S8 字号下限，接管版面库的 18pt 约束 |
-| `--density 22 44` | S8 每页元素数软目标区间 |
+| `--min-font 18` | S8 默认字号下限；不能豁免上游或最终投影检查 |
+| `--density LO HI` | 可选元素数参考，默认关闭，不应以此填满页面 |
 | `--strict` | warning 也当失败 |
 | `--allow-legacy-no-story` | 仅兼容旧输入，跳过 Story provenance；完整 Total-pipe 禁用 |
 
@@ -135,7 +135,7 @@ S0–S8 分别是（**以 `rpa_full_pipeline.py` 的实现编号为准**，别�
 | S5 | `preflight` | `preflight_complete` 且 `status != invalid` |
 | S6 | `visual-fit-preflight` | 每张图不得 `fail` |
 | S7 | `group-fit-preflight` | 每页 ≥2 图时查分组几何 |
-| S8 | `design_land.py` | 出 `design_contract.json` + `_design_brief.md`。**只做准备，恒不 FAIL** |
+| S8 | `design_land.py` | 出 `design_contract.json` + `_design_brief.md`；准备失败不可放行 |
 
 S5 失败时脚本会直接给替代版面（按图槽几何算 contain 填充率排序），照着把该页
 brief 的 `category_hint` 改掉再重跑即可，不用自己翻版面库。
@@ -208,24 +208,46 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/deckplan2slide
 
 ### S8 设计落地层（骨架 → 渲染之间的必经站）
 
-**为什么必须有**：版面库契约每页只给 4–8 个槽、正文下限 18pt（实测见下方表格），
-骨架忠实执行这份契约 → 每页 ~8 个大框、20pt 正文，**观感必然空旷**。
-S8 把字号管辖权从 `layouts.json` 接到自己的 `design_contract.json`，
-让 Agent 在已放行的槽位 bbox **内部**做排版细化与装饰落地。
+可在 slide brief 的 `metadata.presentation_intent` 声明页面意图：
+
+```json
+{"objective":"定量证据只覆盖指定样品", "emphasis":"low",
+ "required_on_screen":["2 nm MoS₂"],
+ "speaker_notes":["补充实验的详细条件"], "appendix":["完整光谱"]}
+```
+
+`objective` 是本页要建立的判断，`emphasis` 为 low/medium/high；RPA 将其写入
+`design_ir.presentation_intent`，并用于主消息与强调等级。其他字段默认空数组。
+两条 telemetry 的 `run_qa.py --plan deck_plan.json` 按页码传入此契约。
+`required_on_screen` 检查渲染文本中的字面短语（忽略空白），不是语义等价判断；
+栅格图片可能包含未识别文字时标为不可评估，需看渲染图确认。
+notes/appendix 字段只是分层计划，不代表已写入 PPT；渲染作者仍须落实。
+影响结论范围的必要限定语不能只放讲稿或附录。
+
+QA 的标准字号单位是 pt；artifact-tool CSS px 按 72/96 转换。
+Total-pipe 的两条 QA 默认启用投影字号门槛，保留 `--viewing-mode` 的显式选择；
+缺失字号数据不可算通过。旧 RPA 调用未启用 `enforce_typography` 时保持原行为。
+两条 QA 脚本在硬失败、字号不可评估或必要短语未确认时退出码为 1，
+汇总 `release_status=blocked`。普通警告或待人工看图标为 `review_required`，
+退出码 0 不等于已完成视觉验收。计划页码与 sidecar 必须匹配，不能默默跳过。
+
+**作用**：在已放行的槽位内部细化视觉组织。少元素和留白不是缺陷；
+优先放大关键证据、删除重复强调，不能为了填空缩字或添加无信息装饰。
+S8 保留上游可读性约束，最终以实际渲染结果检查为准。
 
 契约关系（别搞反）：
 
 | 契约 | 管辖范围 | 字号下限 |
 | :-- | :-- | :-- |
 | `layouts.json` | 版面选槽（S1–S7） | 18pt（实测 `{20:242, 18:78}`） |
-| `design_contract.json` | 槽位内部排版（S8+） | 10.5pt（可 `--min-font` 改） |
+| `design_contract.json` | 槽位内部排版（S8+） | 默认 18pt（显式旧契约仍可加载） |
 
-两者不冲突：S5 preflight 已按 18pt 判过几何兼容并放行，S8 只在槽位内再切分，不再选槽。
+阶段切换不豁免字号约束。旧契约可加载不等于通过最终投影 QA。
 
 ```bash
 DL="C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/design_land.py"
 
-python "$DL" contract --out design_contract.json --min-font 10.5 --density 22 44
+python "$DL" contract --out design_contract.json --min-font 18
 python "$DL" brief --skeleton slides/ --slots slides/_slots.md --out slides/_design_brief.md
 # —— 这里由 Agent 按任务书自由发挥，改写/扩写 slides/*.slide（构图不受脚本约束）——
 python "$DL" check --slides slides/ --contract design_contract.json --out _design_check.md
@@ -240,7 +262,7 @@ python "$DL" check --slides slides/ --contract design_contract.json --out _desig
 
 1. **事实**：每槽 bbox / 容量 / 已用字数 / 未覆盖的空白带 / 本页图片路径
    **+ 每张图的原始像素、图片比例、当前图框、建议图框、不改会裁掉多少**
-2. **软目标**：密度区间（默认 22–44 个元素/页）、字号阶梯、可按需覆盖
+2. **软目标**：字号阶梯；元素数区间仅在显式指定时启用，不是填充任务
 3. **语汇货架**：顶栏标签 / 图注 / 脚注引文 / 指标双列 / 序号徽章 / 关键词高亮 /
    来源标注 / 对比条 / 流程箭头 / 分隔留白 —— **是"货架"不是"清单"，可全不用，可自创**
 
@@ -675,7 +697,7 @@ paperworkflow 同理，python 换成 `F:/Workbuddy/Total-pipe/paperworkflow/.ven
 | slidep validate 报 `CONTENT_OVERFLOW` | 常见触发：给徽章/胶囊里的 Text 加 `lineHeight: '<n>px'`（渲染器行高计算异常） | 去掉 px 行高，改在容器 Box 上定高居中；定位用**变量分离**（宽度改动 / 徽章改动分别单独 validate） |
 | slidep upsert-dsl 报 `10201 Export file is occupied` | pptx 正被编辑器/预览占用 | 先 upsert 到 `_v2.pptx` 副本，再用 `cp` 覆盖原文件（cp 能成功） |
 | 分隔线被判 `ORPHAN_DECORATIVE_ELEMENT` | 宽高比 ≥18 且面积占比 ≤0.02 的 decoration 元素 | 直接删掉分隔线、改用间距分组（加粗到 22px 才不算 thin，不划算） |
-| **成品"太空旷"**：文字飘在白底上，看不到卡片/竖条/装饰 | **根因是缺「设计落地层」，不是缺装饰。** 快路径 S4 出骨架 → 直接 `slidep start`，中间没有 S8 那一站。骨架忠实执行版面库契约（每页 4–8 槽、正文 18pt 下限）→ 必然空旷 | 补跑 S8：`design_land.py brief` 出任务书 → Agent 在槽位内做设计落地 → `check` 验收。详见「S8 设计落地层」节 |
+| 成品层级松散、关键证据太小 | 不以卡片、装饰或元素数多少判断质量 | 检查主结论和证据尺寸，按需重组或放大；保留有意留白，不为填空降字号 |
 | **图片被上下/左右裁掉一截**（图里的标签、图例、坐标轴没了；文字没丢，是画面没了） | slidep 的 pptx 写出端**对图片一律按 cover 裁切到图框比例**，`objectFit` 属性无效（prop/style × contain/cover/fill 五种写法产出逐字节相同）。把图铺满一个比例不同的槽位框 = 必然裁掉长边那一维。判据：pptx 里 `<a:srcRect>` 非零，且 `裁切比 = 1 − min(框AR/图AR, 图AR/框AR)` 完全对得上 | 让**图框宽高比 = 图片文件自身比例**：算 contain 适配矩形 → 图框取该矩形 → 在槽位内居中；图卡 = 适配矩形 + padding，腾出的空档用真实内容（参数表/指标行）填。`design_land.py check` 会判 `IMAGE_ASPECT_MISMATCH` 并给出应改尺寸 |
 | 图片明明在框里居中留白了，`element_area_ratio` 反而掉下来 | 该指标只算**带文本元素 + 图片**的并集，纯色卡片不计；图按比例缩小后图片 bbox 变小 | 把图卡腾出的空档用**带文字的**内容填满（参数行 / 指标行 / 图注），别只留白 |
 | 骨架的图槽注释写着"图槽宽度比 3.16"，但落地时找不到该塞什么比例的图 | `deckplan2slide.py` 只报槽位框比例，不知道你会用哪张图 | 先在 `briefs.json` 的 `visuals` 定好图（或落地层自己选图），再用 `design_land.py brief` 读真实像素算适配矩形 |
@@ -778,7 +800,7 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_
 **断点**：阶段 3 的 S4（`deckplan2slide.py` 骨架生成）**之后**、阶段 4 渲染**之前**——
 快路径缺 S8「设计落地层」。骨架是症状处不是根因；slidep 忠实渲染骨架，无责。
 
-**症状 vs 参考**（同论文、同 13 页、同管线）：
+**历史症状 vs 参考**（同论文、同 13 页、同管线；下列元素数和小字号不是生成目标）：
 
 | | 骨架（快路径） | 参考成品 |
 | :-- | :-- | :-- |
@@ -792,8 +814,8 @@ python "C:/Users/Beibei/.workbuddy/skills/total-pipe-deck/scripts/pipe_coverage_
 
 **两条已排除的弯路**（别再走）：
 
-- **治标无效**——只给骨架加主题 token / 6px 语义竖条 / 白卡圆角。装饰贴在 8 个大框上
-  仍然空，密度问题一点没动。
+- **治标无效**——只给骨架增加竖条、圆角等装饰，不能解决证据太小或视觉层级不清；
+  应先判断关键图是否值得放大，以及重复文本是否应删除。
 - **绕过管线**——用 `ooxml2slide.py` 把一份达标成品转回 `.slide` 当模板。观感能一致，
   但这是拿成品反推，不补管线能力缺口，换个新论文立刻失效。
 

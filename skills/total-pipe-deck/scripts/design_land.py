@@ -12,17 +12,16 @@ design_land.py — S8「设计落地层」：阶段 3 之后、阶段 4 渲染�
     minimum_body_font_pt    {20:242, 18:78}                    → 最小合法正文 18pt
     default_body_font_pt    20（全部 320 版面）
 
-骨架生成器忠实执行这份契约 → 每页 ~8 个大框、20pt 正文，观感必然空旷。
-这一层不改写骨架，而是在**槽位内部**做排版细化与装饰落地，并用自己的契约
-（design_contract.json，默认字号下限 10.5pt）接管字号管辖权。
+这一层在槽位内部细化视觉组织；少元素或留白本身不是缺陷。
+默认字号下限 18pt，不设置元素数目标，不鼓励缩字或增加装饰填空。
 
 契约关系（重要，别搞反）
 ------------------------
     layouts.json 的 18pt 下限  管辖「版面选槽阶段」——S1~S7 必须遵守
     design_contract.json       管辖「槽位内部排版」——S8 及之后遵守
 
-两者不冲突：S5 preflight 已经按 18pt 判过几何兼容并放行；S8 只在已放行的
-槽位 bbox 内部再切分，不再选槽。所以 S8 用 10.5pt 图注不违反任何上游判定。
+S8 不能以阶段切换为由豁免上游可读性约束；最终仍须检查真实渲染结果。
+显式旧契约可读取，但不意味着通过最终投影可读性 QA。
 
 设计原则：不代写设计
 --------------------
@@ -35,7 +34,7 @@ design_land.py — S8「设计落地层」：阶段 3 之后、阶段 4 渲染�
 
 子命令
 ------
-    design_land.py contract --out design_contract.json [--min-font 10.5]
+    design_land.py contract --out design_contract.json [--min-font 18]
     design_land.py brief  --skeleton <骨架目录> --slots <_slots.md> [--content x.md] [--assets <资产目录>...]
     design_land.py check  --slides <落地页目录> [--contract design_contract.json] [--assets <资产目录>...]
 
@@ -57,6 +56,7 @@ brief 会为每张图列出原始尺寸与建议图框；check 对比例不符�
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -67,18 +67,17 @@ FOOTER_TOP = 660
 
 DEFAULT_CONTRACT = {
     "design_layer_version": "1.1.0",
-    "authority": "S8 之后字号由本契约管辖，不再受 layouts.json minimum_body_font_pt(18) 约束",
+    "authority": "保留上游可读性约束；不得为填充空白或增加元素数降低字号",
     "canvas": {"width": CANVAS_W, "height": CANVAS_H},
     "footer_top_px": FOOTER_TOP,
-    "minimum_font_pt": 10.5,
+    "minimum_font_pt": 18,
     "font_ladder_pt": {
         "display": [40, 54],
         "headline": [26, 35],
-        "body": [16, 20],
-        "note": [12, 14],
-        "micro": [10.5, 11],
+        "body": [18, 24],
+        "note": [18, 18],
     },
-    "density_target_shapes_per_page": [22, 44],
+    "density_target_shapes_per_page": None,
     "line_height_ratio": 1.45,
     # 图片图框的宽高比必须等于图片文件自身的宽高比（相对偏差容差）。
     # 这不是审美要求：渲染器对图片一律按 cover 裁切到图框比例，
@@ -92,13 +91,13 @@ DEFAULT_CONTRACT = {
 
 # 语汇菜单：只是「货架」，不是清单。AI 可以全不用，也可以自己发明。
 VOCABULARY = [
-    ("顶栏标签", "页面顶部一条细标签带：章节名 / 关键词 / 状态徽章，把标题区从 1 个元素变成 3–5 个"),
-    ("图注", "图下方 10.5–11pt 的 `Fig. 2e · 说明`，配 1px 上分隔线"),
+    ("顶栏标签", "仅在需要定位章节时添加，避免重复标题"),
+    ("图注", "说明图中必须理解的信息，遵循当前字号下限"),
     ("脚注引文", "页脚左：作者 + 年份 + 期刊；右：页码。中间可插数据来源 / 测试方法"),
     ("指标双列", "把「数值 + 单位」和「对照 / 条件」拆成左右两列，而不是挤进一句话"),
     ("序号徽章", "卡片左上角 01/02/03 的小圆角方块，替代纯文字序号"),
     ("关键词高亮", "一句话里把关键数值用 accent 色单独成段，而不是整句同色"),
-    ("来源标注", "数据旁 10.5pt 的灰字：数据来源、测试条件、样本量"),
+    ("来源标注", "保留影响结论的条件；完整来源可放讲者备注"),
     ("对比条", "两组数值用横向条 + 数字标注，比纯文字更快读"),
     ("流程箭头", "步骤之间加细箭头 / 连接线，把并列的框串成时序"),
     ("分隔与留白", "用 1px 线 + 12–16px 间距做分组，比加大字号更清晰"),
@@ -452,29 +451,27 @@ def blank_bands(boxes: list, footer_top: int = FOOTER_TOP, min_h: int = 24):
 # --------------------------------------------------------------------------- #
 
 def cmd_contract(args):
-    c = dict(DEFAULT_CONTRACT)
-    if args.min_font:
-        c["minimum_font_pt"] = args.min_font
-        c["font_ladder_pt"]["micro"] = [args.min_font, args.min_font]
-    if args.density:
-        lo, hi = args.density
-        c["density_target_shapes_per_page"] = [lo, hi]
+    c = copy.deepcopy(DEFAULT_CONTRACT)
     if os.path.isfile(args.out):
         try:
             with open(args.out, encoding="utf-8") as f:
                 c.update(json.load(f))
         except Exception:
             pass
+    if args.min_font is not None:
+        c["minimum_font_pt"] = args.min_font
+    if args.density is not None:
+        c["density_target_shapes_per_page"] = list(args.density)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(c, f, ensure_ascii=False, indent=2)
     print("design_contract → %s" % args.out)
-    print("  字号下限 %.1fpt · 密度目标 %s 个/页"
-          % (c["minimum_font_pt"], c["density_target_shapes_per_page"]))
+    print("  字号下限 %.1fpt · 元素数参考 %s"
+          % (c["minimum_font_pt"], c["density_target_shapes_per_page"] or "未启用"))
     return 0
 
 
 def load_contract(path: str) -> dict:
-    c = dict(DEFAULT_CONTRACT)
+    c = copy.deepcopy(DEFAULT_CONTRACT)
     if path and os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as f:
@@ -579,7 +576,7 @@ def cmd_brief(args):
     L.append("## §硬约束（违反会被 check 判 FAIL）")
     L.append("")
     L.append("1. 所有元素必须完整落在画布内（x≥0, y≥0, x+w≤%d, y+h≤%d）" % (CANVAS_W, CANVAS_H))
-    L.append("2. 字号 ≥ %.1fpt（这是 S8 自己的下限，版面库的 18pt 在这里不适用）" % args.min_font)
+    L.append("2. 字号 ≥ %.1fpt，并保留更严格的上游要求；不可通过缩字填充版面" % args.min_font)
     L.append("3. 单个框内的文字不得明显溢出（按 CJK 宽度估算）")
     L.append("4. 页脚区（y %d–%d）保留，页码 `NN / %02d` 正确" % (FOOTER_TOP, CANVAS_H, total))
     L.append("5. **图片图框的宽高比必须等于图片文件自身的宽高比**（容差 %.0f%%）。"
@@ -591,8 +588,10 @@ def cmd_brief(args):
     L.append("")
     L.append("## §软目标（参考值，超了也只是 WARN）")
     L.append("")
-    L.append("- 每页元素数建议 %d–%d 个（骨架现在平均 ~8 个，这是「太空旷」的直接原因）"
-             % (args.density[0], args.density[1]))
+    if args.density is not None:
+        L.append("- 用户显式指定的元素数参考区间：%d–%d；不可为达标添加重复内容" % tuple(args.density))
+    else:
+        L.append("- 不设元素数目标。留白和元素数量本身不决定质量；优先保证证据、阅读顺序和投影可读性。")
     L.append("- 字号阶梯：")
     for k, v in DEFAULT_CONTRACT["font_ladder_pt"].items():
         L.append("  - `%s` %s pt" % (k, "–".join(str(x) for x in v)))
@@ -689,9 +688,9 @@ def cmd_brief(args):
         fill = sum(len(b["text"]) for b in boxes)
         L.append("### 落地提示")
         L.append("")
-        L.append("当前 %d 个元素、正文合计 %d 字。想达到软目标密度，主要手段是**把一个大框拆成"
-                 "若干子元素**（标签 / 数值 / 单位 / 对照 / 来源 / 图注），而不是把字号调大。"
-                 "拆分后单个元素字号可以降到 %.1f–14pt，视觉密度会显著上升。" % (len(boxes), fill, args.min_font))
+        L.append("当前 %d 个元素、正文合计 %d 字。确定一个主要理解目标，优先放大关键证据；"
+                 "移除不增加信息的重复强调。必要限定保留在主画面，补充细节分配到讲稿或附录，"
+                 "不可为了填满空白拆分装饰元素或降低字号。" % (len(boxes), fill))
         L.append("")
         L.append("---")
         L.append("")
@@ -709,8 +708,9 @@ def cmd_brief(args):
 
 def cmd_check(args):
     c = load_contract(args.contract)
-    min_font = c.get("minimum_font_pt", 10.5)
-    dlo, dhi = c.get("density_target_shapes_per_page", [22, 44])
+    min_font = c.get("minimum_font_pt", 18)
+    density = c.get("density_target_shapes_per_page")
+    dlo, dhi = density if density is not None else (None, None)
     ratio = c.get("line_height_ratio", 1.45)
     tol = float(c.get("image_frame_aspect_tolerance", 0.02))
     asset_bases = asset_bases_for(args.slides, args.assets)
@@ -781,9 +781,9 @@ def cmd_check(args):
 
         # 5) 密度（只 WARN）
         n = len(shapes)
-        if n < dlo:
+        if dlo is not None and n < dlo:
             warns.append("P%02d LOW_DENSITY: %d 个绝对定位元素 < 建议下限 %d" % (i, n, dlo))
-        elif n > dhi:
+        elif dhi is not None and n > dhi:
             warns.append("P%02d HIGH_DENSITY: %d 个 > 建议上限 %d（确认不是碎片化）" % (i, n, dhi))
 
         # 6) 图片图框比例：渲染器按 cover 裁切，比例不符 = 画面被裁
@@ -842,8 +842,8 @@ def cmd_check(args):
         for f in fails:
             print("  - " + f)
 
-    print("\n平均元素数 %.1f / 页（软目标 %d–%d）"
-          % (sum(r[3] for r in rows) / len(rows), dlo, dhi))
+    print("\n平均元素数 %.1f / 页（元素数参考：%s）"
+          % (sum(r[3] for r in rows) / len(rows), density or "未启用"))
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
@@ -874,7 +874,7 @@ def main():
 
     p = sub.add_parser("contract", help="生成 design_contract.json")
     p.add_argument("--out", required=True)
-    p.add_argument("--min-font", type=float, default=DEFAULT_CONTRACT["minimum_font_pt"])
+    p.add_argument("--min-font", type=float, default=None)
     p.add_argument("--density", nargs=2, type=int, default=None,
                    metavar=("LO", "HI"))
     p.set_defaults(func=cmd_contract)

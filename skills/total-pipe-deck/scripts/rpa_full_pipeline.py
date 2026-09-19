@@ -20,14 +20,12 @@ Agent 得先猜；猜不中就绕过。
     S5  preflight             → preflight_complete 且 status != invalid
     S6  visual-fit-preflight  → 每张图 status 不得 fail
     S7  group-fit-preflight   → 每页 ≥2 图时检查分组几何
-    S8  design_land.py        → 出 design_contract.json + 设计任务书（只做准备，恒不 FAIL）
+    S8  design_land.py        → 出 design_contract.json + 设计任务书（准备失败不可放行）
 
 S8 为什么必须有
 ---------------
-版面库契约每页只给 4–8 个槽、正文下限 18pt（实测 layouts.json v2.0.0），骨架忠实执行
-这份契约 → 每页 ~8 个大框，观感必然空旷。S8 是「阶段 3 之后、渲染之前」的设计落地层：
-它把字号管辖权从 layouts.json 接过来（design_contract.json，默认下限 10.5pt），
-并产出一份设计任务书供 Agent 在槽位内部做排版细化。
+S8 是渲染前的设计落地层，保留上游可读性约束，默认字号下限 18pt。
+产出任务书供 Agent 细化视觉组织，不以元素数量或填满留白为优化目标。
 注意：S8 只做准备，**构图交给人/Agent**，脚本不代写设计。
 
 顺序说明
@@ -319,10 +317,10 @@ def main():
     ap.add_argument("--no-skeleton", action="store_true", help="跳过 S4 骨架生成")
     ap.add_argument("--no-design", action="store_true",
                     help="跳过 S8 设计落地准备（契约 + 设计任务书）")
-    ap.add_argument("--min-font", type=float, default=10.5,
-                    help="S8 的字号下限（接管 layouts.json 的 18pt 约束）")
-    ap.add_argument("--density", nargs=2, type=int, default=[22, 44],
-                    metavar=("LO", "HI"), help="S8 每页元素数软目标区间")
+    ap.add_argument("--min-font", type=float, default=18,
+                    help="S8 字号下限；默认 18pt，不得覆盖更严格的上游要求")
+    ap.add_argument("--density", nargs=2, type=int, default=None,
+                    metavar=("LO", "HI"), help="可选元素数参考区间；默认不设数量目标")
     # 注意：默认输出到 slides_skeleton 而不是 slides，避免一键跑覆盖已完成的页面。
     ap.add_argument("--skeleton-out", default="slides_skeleton",
                     help="骨架输出子目录名（默认 slides_skeleton；"
@@ -724,7 +722,7 @@ def main():
             print("        · P%02d %s %s" % (pg, stt, dec))
 
     # ---------------------------------------------------------------- S8
-    # 设计落地准备：把字号管辖权从 layouts.json(18pt) 接到 design_contract.json(10.5pt)，
+    # 设计落地准备：保留可读性约束，不通过缩小字体填充槽位。
     # 并产出设计任务书。只做准备，**不代写构图**；失败降级为 WARN 而不是 FAIL。
     if args.no_design:
         record("S8", "设计落地准备", "SKIP", "--no-design")
@@ -736,17 +734,18 @@ def main():
         if not os.path.isfile(dl):
             record("S8", "设计落地准备", "SKIP", "找不到 " + dl)
         else:
-            dlo, dhi = args.density
+            density_args = ["--density", *map(str, args.density)] if args.density is not None else []
             contract_path = os.path.join(args.out_dir, "design_contract.json")
-            subprocess.run(
+            contract_result = subprocess.run(
                 [sys.executable, dl, "contract", "--out", contract_path,
-                 "--min-font", str(args.min_font),
-                 "--density", str(dlo), str(dhi)],
+                 "--min-font", str(args.min_font), *density_args],
                 capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if contract_result.returncode != 0:
+                record("S8", "设计落地准备", "FAIL", contract_result.stderr[-200:])
+                return finish(work, steps, failed, warned, args)
             brief_out = os.path.join(skel_dir, "_design_brief.md")
             cmd = [sys.executable, dl, "brief", "--skeleton", skel_dir,
-                   "--out", brief_out, "--min-font", str(args.min_font),
-                   "--density", str(dlo), str(dhi)]
+                   "--out", brief_out, "--min-font", str(args.min_font), *density_args]
             slots_md = os.path.join(skel_dir, "_slots.md")
             if os.path.isfile(slots_md):
                 cmd += ["--slots", slots_md]
@@ -759,8 +758,8 @@ def main():
                                 encoding="utf-8", errors="replace")
             if cb.returncode == 0:
                 record("S8", "设计落地准备", "PASS",
-                       "字号下限 %.1fpt · 密度目标 %d-%d · 任务书已出" % (
-                           args.min_font, dlo, dhi))
+                       "字号下限 %.1fpt · 元素数参考 %s · 任务书已出" % (
+                           args.min_font, args.density or "未启用"))
                 print("        · 契约   → %s" % contract_path)
                 print("        · 任务书 → %s" % brief_out)
                 print("        · ⚠ 图片图框宽高比必须 = 图片文件自身比例，否则被 cover 裁掉")
@@ -769,7 +768,7 @@ def main():
                       % (os.path.join(here, "design_land.py"), contract_path,
                          (" --assets " + design_assets) if design_assets else ""))
             else:
-                record("S8", "设计落地准备", "WARN",
+                record("S8", "设计落地准备", "FAIL",
                        (cb.stdout or cb.stderr or "")[-200:].replace("\n", " "))
 
     return finish(work, steps, failed, warned, args)
