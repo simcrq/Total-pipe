@@ -56,6 +56,25 @@ SKILL.md。本 skill 专注孪生渲染遥测。
 
 ## 脚本
 
+### 可选原生列表（兼容现有 text 元素）
+
+新增 `t: "list"` 元素，保留 `items: string[]`，使用与正文相同的 x/y/w/h。
+通过 `listStyle: {fontSizePt: 18, minFontSizePt: 17, gapPt: 16}` 显式指定
+字号与段后距（单位 pt），几何仍为 px。`native_list.mjs` 可供主生成器和
+孪生共用；列表使用原生 bullet、悬挂缩进和 `autoFit: none`，不自动缩字。
+旧 `t: "text"` 与 `fs` 的 px 语义不变。相同段后距不等于文字占满容器，
+应在真实渲染后检查换行、占用高度与留白，再调整间距或容器。
+导出后可运行 `../pptx-telemetry/scripts/check_native_lists.py`，对指定
+页面/形状验证实际 pt 字号、原生 bullet 与段距。该检查不声称测得视觉均匀度。
+
+中文长句可设置 `listStyle.autoWrap: true`：`wrap_cjk.mjs` 使用后端自带的
+skia-canvas 按选定字体实测字宽，扣除内边距与 bullet 缩进后，通过动态规划
+选择换行点。优先保留词语边界，保护英文/化学式样式连续字符与常用数字单位，
+处理中文避头尾标点，并保留显式换行。不可拆分的单词超过可用宽度时报错，
+不静默缩字。默认列表内边距为 0，可通过 `insets`（px）设置。
+启用自动换行需后端可解析 `skia-canvas`；不存在时显式失败，不换用不同字体度量。
+渲染后检查字号与孤立 bullet，仍需检查真实页面高度和目标应用的显示效果。
+
 | 脚本 | 作用 |
 |---|---|
 | `scripts/render_layouts.mjs` | deck spec JSON → 逐页 layout/v4（真实字体度量） |

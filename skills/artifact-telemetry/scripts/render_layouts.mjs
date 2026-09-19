@@ -34,6 +34,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createRequire } from 'node:module';
+import { canvasMeasurer } from './wrap_cjk.mjs';
+import { applyNativeList, checkNativeListLayout } from "./native_list.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) { console.error("usage: node render_layouts.mjs <deck-spec.json>"); process.exit(2); }
@@ -74,6 +77,20 @@ const KIND = {
   rect: (slide, o) => rect(slide, o),
   card: (slide, o) => rect(slide, o),
   text: (slide, o) => textShape(slide, o),
+  // New opt-in element; existing text specs retain their exact behavior.
+  list: (slide, o) => {
+    const options = {...o.listStyle};
+    const insets = o.insets ?? {left:0,right:0,top:0,bottom:0};
+    if (options.autoWrap === true) {
+      const canvas = createRequire(path.join(AT, 'package.json'))('skia-canvas');
+      options.wrapWidthPx = o.w - (insets.left ?? 0) - (insets.right ?? 0);
+      options.measureText = canvasMeasurer(canvas, {typeface:o.typeface ?? FONT,
+        fontSizePx:(options.fontSizePt ?? 18)*96/72, bold:o.bold});
+    }
+    const shape = textShape(slide, { ...o, text: '' });
+    shape.text.style = {insets};
+    return applyNativeList(shape, o.items, options);
+  },
   pill: (slide, o) => textShape(slide, { ...o, geometry: "roundRect" }),
   dot: (slide, o) => rect(slide, { ...o, geometry: "ellipse" }),
   image: (slide, o) => {
@@ -112,6 +129,21 @@ for (const s of spec.slides) {
   }
   for (const el of s.elements ?? []) addElement(slide, el);
   const doc = await (await slide.export({ format: "layout" })).text();
+  // Only opt-in lists get this new gate. Legacy text output is unchanged.
+  const layout = JSON.parse(doc);
+  const verifyLists = (elements) => {
+    for (const el of elements ?? []) {
+      if (el.t === 'list') {
+        const matched = layout.elements.filter(e => e.name === el.name);
+        const issues = matched.length === 1
+          ? checkNativeListLayout(matched[0], el.listStyle?.minFontSizePt ?? 17)
+          : ['LIST_SHAPE_NOT_UNIQUE'];
+        if (issues.length) throw new Error(`${s.name}/${el.name}: ${issues.join(', ')}`);
+      }
+      verifyLists(el.children);
+    }
+  };
+  verifyLists(s.elements);
   const out = path.join(spec.out_dir, `${s.name}.json`);
   fs.writeFileSync(out, doc);
   console.log("layout written:", out);
